@@ -716,6 +716,40 @@ void parse_and_apply_json_command(char* json_str)
         //return; // Не удалось захватить мьютекс — пропускаем команду
     //}
 
+    // === 0. Флаг "у сервера есть свежие данные" (isNeedToRefresh) ===
+    // ВАЖНО (фикс "перещёлкивания" света/режима при медленном интернете):
+    // модуль связи (NT1-M) шлёт этот топик по USART2 ПОСТОЯННО, даже когда
+    // ничего не менялось. По протоколу сервера isNeedToRefresh:true означает
+    // "данные реально изменились, mode/light/tempSet в этом сообщении
+    // актуальны"; isNeedToRefresh:false означает "уже синхронизировано" —
+    // но это НЕ значит, что mode/light/tempSet в таком сообщении совпадают с
+    // текущим состоянием контроллера! Это может быть просто старый снимок
+    // топика, ещё не догнавший изменение, которое пользователь только что
+    // сделал на экране (см. handle_dwin_command). Раньше mode/light/tempSet
+    // разбирались и применялись из ЛЮБОГО входящего сообщения безусловно —
+    // из-за этого такой устаревший снимок переигрывал (откатывал) действие
+    // с экрана обратно, пока сервер не догонял реальное состояние. Поэтому
+    // без isNeedToRefresh:true в сообщении вообще не парсим и не применяем
+    // mode/light/tempSet — выходим сразу.
+    // На реакцию самого экрана (handle_dwin_command) это никак не влияет —
+    // она обрабатывается по USART3 независимо от USART2/сервера, поэтому
+    // при отсутствии связи с сервером кнопки на DWIN продолжают работать
+    // как обычно.
+    uint8_t server_has_fresh_data = 0;
+    char* refresh = strstr(json_str, "\"isNeedToRefresh\":");
+    if (refresh) {
+        refresh += 18; // Пропускаем "\"isNeedToRefresh\":"
+        while (*refresh == ' ' || *refresh == '\t' || *refresh == '\n' || *refresh == '\r') {
+            refresh++;
+        }
+        if (strncmp(refresh, "true", 4) == 0) {
+            server_has_fresh_data = 1;
+        }
+    }
+    if (!server_has_fresh_data) {
+        return; // нечего применять — сервер ещё не сообщил ничего нового
+    }
+
     // === 1. Парсинг поля "mode" ===
     char* mode_start = strstr(json_str, "\"mode\":\"");
     if (mode_start) {
@@ -782,22 +816,10 @@ void parse_and_apply_json_command(char* json_str)
 					}
         }
     }
-		// === 4. Парсинг поля "isNeedToRefresh" ===
-		char* refresh = strstr(json_str, "\"isNeedToRefresh\":");
-		if (refresh) {
-			refresh += 18; // Пропускаем "\"isNeedToRefresh\":"
-			// 1. Пропускаем все пробелы, табуляции и переносы строк после двоеточия
-    while (*refresh == ' ' || *refresh == '\t' || *refresh == '\n' || *refresh == '\r') {
-        refresh++;
-    }
-    
-			if (strncmp(refresh, "true", 4) == 0) {
-				isNeedToRefresh = 0;
-			}
-			//if (strncmp(refresh, "false", 5) == 0) {
-			//}
-		}
-		
+		// === 4. Подтверждение получено (мы уже точно знаем server_has_fresh_data==1,
+		// иначе вышли бы из функции раньше) — сбрасываем локальный флаг "жду
+		// синхронизации" с экрана, если он был выставлен handle_dwin_command(). ===
+		isNeedToRefresh = 0;
 
     // === 5. Сохраняем изменения во флеш НЕМЕДЛЕННО ===
 		//Сохранять нужно только при условии если параметры топиков отличаются т.е. когда топики не равны
