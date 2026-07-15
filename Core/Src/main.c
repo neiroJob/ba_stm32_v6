@@ -1066,15 +1066,45 @@ void StartGlobalTask(void *argument)
 	uint8_t last_ico_doliv = 0xFF;
   uint8_t last_ico_filtern = 0xFF;
   uint8_t last_ico_heating = 0xFF;
-	
+
+  // dwin2, живое зеркалирование настроек между экранами: последнее
+  // значение каждого поля, которое реально ушло в write_variable(). Пока
+  // на снимке (s_*) то же самое значение — ничего не шлём; как только
+  // где-то (с любого из двух экранов ИЛИ из приложения) поле поменяли —
+  // на следующем проходе цикла (до ~300 мс) значение уйдёт на ОБА канала
+  // (write_variable сама решит, в какой канал реально слать — см.
+  // DWIN_Channel_IsEnabled: неактивный/невыключенный канал пропускается
+  // мгновенно, без блокировки на HAL_UART_Transmit, так что при схемах
+  // "только один экран" или "экрана вообще нет" это зеркалирование не
+  // создаёт никакой задержки в цикле).
+  // 0xFFFF — сентинел ("ещё ни разу не отправляли"), гарантирует, что на
+  // самом первом проходе цикла будет как минимум одна рассылка каждого поля.
+  uint16_t last_mirrored_mode = 0xFFFF;
+  uint16_t last_mirrored_target_temp = 0xFFFF;
+  uint16_t last_mirrored_gisterezis = 0xFFFF;
+  uint16_t last_mirrored_svet = 0xFFFF;
+  uint16_t last_mirrored_timeout_err = 0xFFFF;
+  uint16_t last_mirrored_doliv_time = 0xFFFF;
+  uint16_t last_mirrored_main_display_en = 0xFFFF;
+  uint16_t last_mirrored_remote_display_en = 0xFFFF;
+
 	uint8_t s_filling_active = 0;
   uint8_t s_filling_error = 0;
   uint8_t s_filling_svet = 0;
-  
+
   uint8_t s_filling_auto_time = 0;
   uint8_t s_filling_heating_priority = 0;
   uint8_t s_filling_heating = 0;
 	pool_mode_t s_mode = POOL_MODE_OFF;
+  // dwin2: остальные поля-"настройки", которые тоже нужно живьём зеркалировать
+  // на оба экрана (см. last_mirrored_* выше) — раньше они читались/писались
+  // только один раз при старте задачи.
+  uint8_t s_target_temp = 0;
+  uint8_t s_delta_target_temp = 0;
+  uint8_t s_filling_timeout_min = 0;
+  uint8_t s_filling_doliv_time = 0;
+  uint8_t s_main_display_enabled = 0;
+  uint8_t s_remote_display_enabled = 0;
 
   // Тут нужно загрузить состояние системы из EEPROM
   load_pool_state_from_flash(); // ← загружаем состояние при старте
@@ -1251,6 +1281,13 @@ void StartGlobalTask(void *argument)
       s_filling_auto_time        = g_pool_state.filling_auto_time;
       s_filling_heating_priority = g_pool_state.filling_heating_priority;
       s_filling_heating          = g_pool_state.filling_heating;
+      // dwin2: снимок полей-"настроек" для живого зеркалирования на оба экрана
+      s_target_temp              = g_pool_state.target_temp;
+      s_delta_target_temp        = g_pool_state.delta_target_temp;
+      s_filling_timeout_min      = g_pool_state.filling_timeout_min;
+      s_filling_doliv_time       = g_pool_state.filling_doliv_time;
+      s_main_display_enabled     = g_pool_state.main_display_enabled;
+      s_remote_display_enabled   = g_pool_state.remote_display_enabled;
 
       osMutexRelease(MutexStateHandle);
     }
@@ -1282,6 +1319,53 @@ void StartGlobalTask(void *argument)
       osDelay(pdMS_TO_TICKS(20));
       write_variable(DWIN_ADDR_FILLING_RESET, 0x0011); // Кнопка сброса СКРЫТА
       active_button_reset = 0;
+    }
+
+    // === Живое зеркалирование "настроечных" полей на оба экрана ===
+    // Раньше mode/target_temp/гистерезис/свет/timeout/doliv_time/чекбоксы
+    // писались на экран только один раз при старте задачи — если поменять их
+    // с ОДНОГО экрана, второй (или тот же самый после ручного изменения на
+    // сервере) не узнавал об этом, пока устройство не перезагружали. Теперь,
+    // как и иконки выше, они сверяются с последним отправленным значением
+    // каждый проход цикла (~300 мс) и досылаются при реальном изменении —
+    // независимо от того, КТО их поменял: любой из двух экранов или JSON
+    // с сервера (parse_and_apply_json_command трогать не стали — см. dwin2:
+    // её собственный write_variable для mode/light/tempSet просто станет
+    // тут избыточным на один лишний проход, это не ошибка).
+    // write_variable() сама решает, в какой из двух каналов реально писать
+    // (DWIN_Channel_IsEnabled) — если экрана на канале нет физически,
+    // соответствующая отправка пропускается мгновенно, без задержек.
+    if ((uint16_t)s_mode != last_mirrored_mode) {
+      write_variable(DWIN_ADDR_MODE, s_mode);
+      last_mirrored_mode = (uint16_t)s_mode;
+    }
+    if ((uint16_t)s_target_temp != last_mirrored_target_temp) {
+      write_variable(DWIN_ADDR_TARGET_TEMP, s_target_temp);
+      last_mirrored_target_temp = (uint16_t)s_target_temp;
+    }
+    if ((uint16_t)s_delta_target_temp != last_mirrored_gisterezis) {
+      write_variable(DWIN_ADDR_GISTEREZIS, s_delta_target_temp);
+      last_mirrored_gisterezis = (uint16_t)s_delta_target_temp;
+    }
+    if ((uint16_t)s_filling_svet != last_mirrored_svet) {
+      write_variable(DWIN_ADDR_SVET, s_filling_svet);
+      last_mirrored_svet = (uint16_t)s_filling_svet;
+    }
+    if ((uint16_t)s_filling_timeout_min != last_mirrored_timeout_err) {
+      write_variable(DWIN_ADDR_TIMEOUT_ERR, s_filling_timeout_min);
+      last_mirrored_timeout_err = (uint16_t)s_filling_timeout_min;
+    }
+    if ((uint16_t)s_filling_doliv_time != last_mirrored_doliv_time) {
+      write_variable(DWIN_ADDR_DOLIV_TIME, s_filling_doliv_time);
+      last_mirrored_doliv_time = (uint16_t)s_filling_doliv_time;
+    }
+    if ((uint16_t)s_main_display_enabled != last_mirrored_main_display_en) {
+      write_variable(DWIN_ADDR_MAIN_DISPLAY_EN, s_main_display_enabled);
+      last_mirrored_main_display_en = (uint16_t)s_main_display_enabled;
+    }
+    if ((uint16_t)s_remote_display_enabled != last_mirrored_remote_display_en) {
+      write_variable(DWIN_ADDR_REMOTE_DISPLAY_EN, s_remote_display_enabled);
+      last_mirrored_remote_display_en = (uint16_t)s_remote_display_enabled;
     }
 
     // Свет в бассейне вкл\выкл
