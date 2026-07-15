@@ -119,6 +119,9 @@ volatile uint8_t current_day_of_week = 1; // День недели (1=Пн, 7=В
 // а сам канал инициализируется в StartGlobalTask() через DWIN_Channel_Init().
 // Диспетчеризация приёма — в HAL_UART_RxCpltCallback() ниже.
 dwin_channel_t dwin_main;
+// === DWIN: канал выносного экрана / платы-посредника (USART1, смещение
+// VP-адресов = +0x1000, см. DWIN_REMOTE_ADDR_OFFSET в pool_types.h) ===
+dwin_channel_t dwin_remote;
 // === Для приёма команд по USART2 ===
 #define USART2_RX_BUFFER_SIZE 128
 uint8_t usart2_rx_byte;
@@ -541,7 +544,15 @@ void write_variable(uint16_t vp_address, uint16_t data) {
   // (вызовов write_variable() по проекту много, менять их все ни к чему).
   // Сама отправка (сборка кадра 5A A5 05 82 VPH VPL DH DL и HAL_UART_Transmit)
   // теперь в DWIN_WriteVariable() — см. Library/dwin.c.
+  //
+  // dwin2, Шаг 2: экраны зеркалируют друг друга, поэтому write_variable()
+  // теперь шлёт в ОБА канала — DWIN_WriteVariable() сама прибавит нужное
+  // смещение адреса (0 для главного экрана, +0x1000 для выносного) и сама
+  // же тихо пропустит отправку в канал, чей экран сейчас выключен в
+  // настройках (main_display_enabled/remote_display_enabled) — см.
+  // DWIN_Channel_IsEnabled() в Library/dwin.c.
   DWIN_WriteVariable(&dwin_main, vp_address, data);
+  DWIN_WriteVariable(&dwin_remote, vp_address, data);
 }
 /**
  * @brief  Функция инициализации начальными значениями структуры.
@@ -561,6 +572,11 @@ void init_pool_state(void) {
   g_pool_state.filling_heating_priority = 1;	// Флаг приоритета нагрева
   g_pool_state.filling_doliv_time = 5; 				// Время задержки включения долива(сек)
 	g_pool_state.count_refresh_eeprom = 0;			//Количество записи в Flash
+	// dwin2, Шаг 2: по умолчанию (первая прошивка/первый запуск) оба экрана
+	// считаются подключенными — так удобнее тестировать. На конкретной
+	// инсталляции пользователь потом сам выключит ненужный экран галочкой.
+	g_pool_state.main_display_enabled = 1;
+	g_pool_state.remote_display_enabled = 1;
 }
 /**
  * @brief  Функция записи данных в память.
@@ -690,6 +706,21 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     // по той же общей DWIN-архитектуре (см. Library/dwin.h) — тогда сюда добавится
     // вызов нового обработчика вместо старого Servo_RequestBackwash().
     break;
+
+  case DWIN_ADDR_MAIN_DISPLAY_EN: // 0x5900 - Чекбокс "Основной экран подключен"
+    if (g_pool_state.main_display_enabled != (value != 0)) {
+      g_pool_state.main_display_enabled = (value != 0) ? 1 : 0;
+      changed = 1;
+    }
+    break;
+
+  case DWIN_ADDR_REMOTE_DISPLAY_EN: // 0x5901 - Чекбокс "Выносной экран подключен"
+    if (g_pool_state.remote_display_enabled != (value != 0)) {
+      g_pool_state.remote_display_enabled = (value != 0) ? 1 : 0;
+      changed = 1;
+    }
+    break;
+
   default:
     // Неизвестная команда — игнорируем
     break;
@@ -861,8 +892,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         }
         HAL_UART_Receive_IT(&huart2, &usart2_rx_byte, 1);
     }
-	// USART1 (плата-посредник / выносной экран DWIN) — подключается в Шаге 2
-	// (см. dwin2), пока не используется.
+	if (huart->Instance == USART1) {
+		// Выносной экран / плата-посредник. Тот же общий код разбора кадра,
+		// что и для главного экрана — просто другой канал (dwin_remote,
+		// смещение адреса +0x1000).
+		DWIN_Channel_RxCpltFromISR(&dwin_remote);
+	}
 
 }
 /**
@@ -878,7 +913,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART3) {
     DWIN_Channel_ErrorFromISR(&dwin_main);
   }
-  // USART1 (dwin_remote) добавится в Шаге 2.
+  if (huart->Instance == USART1) {
+    DWIN_Channel_ErrorFromISR(&dwin_remote);
+  }
 }
 /**
  * @brief  Запрос текущего часа у дисплея
@@ -1024,13 +1061,22 @@ void StartGlobalTask(void *argument)
   load_pool_state_from_flash(); // ← загружаем состояние при старте
   // Ждем пока заставка на дисплее прогрузится
   osDelay(2000);
-  // Инициализация DWIN-канала главного экрана: смещение адресов VP = 0,
-  // enabled_flag = NULL (родной экран основного блока отключить нельзя).
-  // ВАЖНО: делать это нужно ДО первого write_variable() ниже — иначе
-  // DWIN_WriteVariable() будет писать в неинициализированный dwin_main.huart.
-  // Сама инициализация уже запускает приём по прерыванию на huart3, поэтому
-  // отдельный HAL_UART_Receive_IT(&huart3, ...) ниже по коду больше не нужен.
-  DWIN_Channel_Init(&dwin_main, &huart3, 0, NULL);
+  // Инициализация DWIN-каналов. ВАЖНО: делать это нужно ДО первого
+  // write_variable() ниже — он теперь шлёт в ОБА канала сразу (см. dwin2,
+  // Шаг 2), и если хотя бы один из них не инициализирован,
+  // DWIN_WriteVariable() обратится к нулевому huart (dwin_remote.huart==NULL
+  // до первого DWIN_Channel_Init) — крах. Сама инициализация уже запускает
+  // приём по прерыванию на соответствующем UART, поэтому отдельных
+  // HAL_UART_Receive_IT(...) для USART3/USART1 в коде больше нет.
+  //
+  // Главный экран (USART3, смещение адресов VP = 0). enabled_flag указывает
+  // на pool_state — экран может быть физически не подключен (см. схему
+  // инсталляции "только выносной экран"), тогда main_display_enabled=0 и
+  // DWIN_WriteVariable в этот канал ничего слать не будет.
+  DWIN_Channel_Init(&dwin_main, &huart3, 0, &g_pool_state.main_display_enabled);
+  // Выносной экран / плата-посредник (USART1, смещение адресов VP = +0x1000).
+  DWIN_Channel_Init(&dwin_remote, &huart1, DWIN_REMOTE_ADDR_OFFSET,
+                     &g_pool_state.remote_display_enabled);
   // Тут проверяем нужно выключать кнопку "Перезагрузить" долив или нет
   if (g_pool_state.filling_error) {
     write_variable(DWIN_ADDR_FILLING_RESET, 0x0000); // Если есть ошибка отображаем кнопку на главном экране
@@ -1057,6 +1103,10 @@ void StartGlobalTask(void *argument)
   osDelay(50);
   write_variable(DWIN_ADDR_SVET, g_pool_state.filling_svet); // Выводим состояние кнопки освещения бассейна
   osDelay(50);
+  write_variable(DWIN_ADDR_MAIN_DISPLAY_EN, g_pool_state.main_display_enabled); // Чекбокс "Основной экран подключен"
+  osDelay(50);
+  write_variable(DWIN_ADDR_REMOTE_DISPLAY_EN, g_pool_state.remote_display_enabled); // Чекбокс "Выносной экран подключен"
+  osDelay(50);
   osDelay(100);
   request_rtc_time(); // Запрос данных с rtc
   osDelay(200);
@@ -1078,10 +1128,16 @@ void StartGlobalTask(void *argument)
     // кадра дольше таймаута (см. DWIN_RX_STUCK_TIMEOUT_MS в dwin.c) — канал
     // мягко перезапускается сам. Здесь только регулярный вызов "тика".
     DWIN_Channel_Poll(&dwin_main, HAL_GetTick());
+    DWIN_Channel_Poll(&dwin_remote, HAL_GetTick());
     // === ОБРАБОТКА ВСЕХ НАКОПИВШИХСЯ ПАКЕТОВ ГЛАВНОГО ЭКРАНА (USART3) ===
     {
       dwin_packet_t pkt;
       while (DWIN_Channel_PopPacket(&dwin_main, &pkt)) {
+        // Экран выключен в настройках ("физически его нет") — просто
+        // выбрасываем всё, что накопилось в очереди, ничего не применяя.
+        if (!DWIN_Channel_IsEnabled(&dwin_main)) {
+          continue;
+        }
         // --- Ответ на запрос текущего времени (системный регистр 0x0010) ---
         // Это НЕ пользовательский VP, поэтому смещение канала (addr_offset)
         // тут не применяется — разбирается как отдельный частный случай ДО
@@ -1104,12 +1160,35 @@ void StartGlobalTask(void *argument)
         // --- Обычная команда записи/чтения VP (0x82/0x83) ---
         // Адрес переводится из "проводного" домена канала в родной 0x5000-домен
         // через DWIN_Channel_ToLocalAddr(). Для USART3 (dwin_main) смещение
-        // равно 0, поэтому число не меняется — но код уже общий для любого
-        // канала (см. аналогичную обработку для dwin_remote в Шаге 2).
+        // равно 0, поэтому число не меняется.
         if (pkt.length >= 5 && (pkt.data[0] == 0x82 || pkt.data[0] == 0x83)) {
           uint16_t raw_addr = (uint16_t)((pkt.data[1] << 8) | pkt.data[2]);
           uint16_t value = (uint16_t)((pkt.data[4] << 8) | pkt.data[5]);
           uint16_t addr = DWIN_Channel_ToLocalAddr(&dwin_main, raw_addr);
+          handle_dwin_command(addr, value);
+        }
+      }
+    }
+    // === ОБРАБОТКА ВСЕХ НАКОПИВШИХСЯ ПАКЕТОВ ВЫНОСНОГО ЭКРАНА (USART1) ===
+    // Код намеренно 1:1 повторяет структуру блока главного экрана выше (без
+    // разбора RTC-ответа — время запрашивается только у главного экрана,
+    // см. request_rtc_time()) — это и есть переиспользование универсального
+    // разбора DWIN, о котором просили в Шаге 1: единственная разница между
+    // каналами — addr_offset внутри dwin_remote/dwin_main, весь остальной
+    // код идентичен.
+    {
+      dwin_packet_t pkt;
+      while (DWIN_Channel_PopPacket(&dwin_remote, &pkt)) {
+        // Выносной экран выключен в настройках ("физически его нет") —
+        // накопленные пакеты выбрасываем, не применяя (см. main_display_enabled
+        // выше — тот же принцип, отдельный флаг remote_display_enabled).
+        if (!DWIN_Channel_IsEnabled(&dwin_remote)) {
+          continue;
+        }
+        if (pkt.length >= 5 && (pkt.data[0] == 0x82 || pkt.data[0] == 0x83)) {
+          uint16_t raw_addr = (uint16_t)((pkt.data[1] << 8) | pkt.data[2]);
+          uint16_t value = (uint16_t)((pkt.data[4] << 8) | pkt.data[5]);
+          uint16_t addr = DWIN_Channel_ToLocalAddr(&dwin_remote, raw_addr);
           handle_dwin_command(addr, value);
         }
       }
