@@ -834,19 +834,19 @@
           <GroupName>Library</GroupName>
           <Files>
             <File>
-              <FileName>servo.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Library\servo.c</FilePath>
-            </File>
-            <File>
-              <FileName>servo.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Library\servo.h</FilePath>
-            </File>
-            <File>
               <FileName>pool_types.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Library\pool_types.h</FilePath>
+            </File>
+            <File>
+              <FileName>dwin.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Library\dwin.c</FilePath>
+            </File>
+            <File>
+              <FileName>dwin.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Library\dwin.h</FilePath>
             </File>
           </Files>
         </Group>

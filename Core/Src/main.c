@@ -27,8 +27,8 @@
 #include "stdio.h"
 #include <string.h>
 #include <stdlib.h>
-#include "servo.h"
 #include "pool_types.h"
+#include "dwin.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -112,10 +112,13 @@ volatile uint8_t isNeedToRefresh = 0;
 // === Текущее время от дисплея ===
 volatile uint8_t current_hour = 0;        // Текущий час (0-23)
 volatile uint8_t current_day_of_week = 1; // День недели (1=Пн, 7=Вс)
-// Для приёма данных по UART 3
-uint8_t usart3_rx_byte; // Буфер приёма 1 байта
-#define MAX_PACKET_LEN 16
-#define PACKET_QUEUE_SIZE 4 // Достаточно для 2-3 пакетов подряд
+// === DWIN: канал главного экрана (USART3, смещение VP-адресов = 0) ===
+// Раньше здесь была россыпь глобальных переменных под ручную стейт-машину
+// разбора кадра (uart_rx_state, packet_buffer, packet_index, packet_queue...).
+// Теперь весь этот стейт инкапсулирован в dwin_channel_t (Library/dwin.c/.h),
+// а сам канал инициализируется в StartGlobalTask() через DWIN_Channel_Init().
+// Диспетчеризация приёма — в HAL_UART_RxCpltCallback() ниже.
+dwin_channel_t dwin_main;
 // === Для приёма команд по USART2 ===
 #define USART2_RX_BUFFER_SIZE 128
 uint8_t usart2_rx_byte;
@@ -123,27 +126,6 @@ char usart2_rx_buffer[USART2_RX_BUFFER_SIZE];
 char usart2_cmd_copy[USART2_RX_BUFFER_SIZE];
 volatile uint16_t usart2_rx_index = 0;
 volatile uint8_t usart2_command_ready = 0;
-typedef struct {
-  uint8_t length;
-  uint8_t data[MAX_PACKET_LEN];
-} uart_packet_t;
-
-uart_packet_t packet_queue[PACKET_QUEUE_SIZE];
-volatile uint8_t packet_queue_head = 0; // Куда пишет прерывание
-volatile uint8_t packet_queue_tail = 0; // Откуда читает задача
-
-typedef enum {
-  UART_STATE_WAIT_START1,
-  UART_STATE_WAIT_START2,
-  UART_STATE_WAIT_LEN,
-  UART_STATE_RECEIVING
-} uart_rx_state_t;
-uart_rx_state_t uart_rx_state = UART_STATE_WAIT_START1;
-uint8_t packet_len = 0;
-uint8_t packet_index = 0;
-uint8_t packet_buffer[MAX_PACKET_LEN];
-volatile uint8_t new_packet_flag = 0; // Флаг готовности пакета
-extern uint8_t uart1_rx_byte;
 pool_state_t g_pool_state;
 /* USER CODE END PV */
 
@@ -204,7 +186,6 @@ int main(void)
   MX_USART2_UART_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
-	Servo_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -555,15 +536,12 @@ static void MX_GPIO_Init(void)
  * @retval None
  */
 void write_variable(uint16_t vp_address, uint16_t data) {
-  uint8_t tx_buffer[8] = {0x5A,
-                          0xA5,
-                          0x05,
-                          0x82,
-                          (vp_address >> 8) & 0xFF,
-                          vp_address & 0xFF,
-                          (data >> 8) & 0xFF,
-                          data & 0xFF};
-  HAL_UART_Transmit(&huart3, tx_buffer, 8, 20);
+  // Тонкая обёртка над универсальной DWIN-библиотекой ради обратной
+  // совместимости имени/сигнатуры со всем остальным кодом main.c
+  // (вызовов write_variable() по проекту много, менять их все ни к чему).
+  // Сама отправка (сборка кадра 5A A5 05 82 VPH VPL DH DL и HAL_UART_Transmit)
+  // теперь в DWIN_WriteVariable() — см. Library/dwin.c.
+  DWIN_WriteVariable(&dwin_main, vp_address, data);
 }
 /**
  * @brief  Функция инициализации начальными значениями структуры.
@@ -706,10 +684,11 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     }
     break;
 		
-	case DWIN_ADDR_FLUSHING_ON: // 0x5019 - Кнопка промывки
-    if (value != 0 && !servo_sequence_active) {  // value!=0 = нажатие, !active = не запущено
-        Servo_RequestBackwash();  // ← Сигнал задаче ServoTask
-    }
+  case DWIN_ADDR_FLUSHING_ON: // 0x5019 - Кнопка промывки
+    // Модуль сервопривода обратной промывки временно удалён (см. dwin2).
+    // Вернётся позже как отдельная подсистема, управляемая VP-адресами 0x7000-0x73E7,
+    // по той же общей DWIN-архитектуре (см. Library/dwin.h) — тогда сюда добавится
+    // вызов нового обработчика вместо старого Servo_RequestBackwash().
     break;
   default:
     // Неизвестная команда — игнорируем
@@ -836,78 +815,10 @@ void parse_and_apply_json_command(char* json_str)
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART3) {
-    uint8_t data = usart3_rx_byte; // usart3_rx_byte — глобальная переменная
-
-    switch (uart_rx_state) {
-    case UART_STATE_WAIT_START1:
-      if (data == 0x5A) {
-        uart_rx_state = UART_STATE_WAIT_START2;
-      }
-      break;
-
-    case UART_STATE_WAIT_START2:
-      if (data == 0xA5) {
-        uart_rx_state = UART_STATE_WAIT_LEN;
-      } else {
-        uart_rx_state = UART_STATE_WAIT_START1; // Сброс при ошибке
-      }
-      break;
-
-    case UART_STATE_WAIT_LEN:
-      packet_len = data; // ← ЗАПИСЬ В ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ!
-      if (packet_len >= 3 && packet_len <= MAX_PACKET_LEN) {
-        packet_index = 0; // ← СБРОС ГЛОБАЛЬНОГО ИНДЕКСА!
-        uart_rx_state = UART_STATE_RECEIVING;
-      } else {
-        uart_rx_state = UART_STATE_WAIT_START1; // Некорректная длина
-      }
-      break;
-
-    case UART_STATE_RECEIVING:
-      if (packet_index < MAX_PACKET_LEN) {
-        packet_buffer[packet_index] = data; // Запись в буфер
-        packet_index++; // ← ИНКРЕМЕНТ ГЛОБАЛЬНОГО ИНДЕКСА!
-      }
-      if (packet_index >= packet_len) {
-        // === ПАРСИНГ ОТВЕТА НА ЗАПРОС ВРЕМЕНИ (адрес 0x0010) ===
-        // packet_buffer содержит полезную нагрузку (без 5A A5 LL)
-        // Структура ответа: 83 00 10 04 [8 байт данных]
-        if (packet_len >= 12 && packet_buffer[0] == 0x83 &&
-            packet_buffer[1] == 0x00 && packet_buffer[2] == 0x10) {
-
-          // Байт 7 = день недели (1-7), байт 8 = час (0-23)
-          // Пример пакета: 5A A5 0C 83 00 10 04 1A 02 07 06 0F 2E 01 00
-          // Индексы в packet_buffer: [0]=83, [1]=00, [2]=10, [3]=04, [4]=1A,
-          // [5]=02, [6]=07, [7]=06, [8]=0F, ...
-          uint8_t day_of_week = packet_buffer[7]; // 06 = суббота
-          uint8_t hour = packet_buffer[8];        // 0F = 15 часов
-
-          // Защита от некорректных значений
-          if (day_of_week >= 1 && day_of_week <= 7) {
-            current_day_of_week = day_of_week;
-          }
-          if (hour <= 23) {
-            current_hour = hour;
-          }
-        }
-
-        // === КЛАДЁМ ПАКЕТ В ОЧЕРЕДЬ ===
-        uint8_t next_head = (packet_queue_head + 1) % PACKET_QUEUE_SIZE;
-        if (next_head != packet_queue_tail) { // Проверка переполнения
-          packet_queue[packet_queue_head].length = packet_len;
-          memcpy(packet_queue[packet_queue_head].data, packet_buffer,
-                 packet_len);
-          packet_queue_head = next_head;
-        }
-
-        // Сброс состояния автомата для приёма следующего пакета
-        uart_rx_state = UART_STATE_WAIT_START1;
-      }
-      break;
-    }
-
-    // Запускаем приём следующего байта (ВАЖНО: вызывать ОДИН РАЗ в конце!)
-    HAL_UART_Receive_IT(&huart3, &usart3_rx_byte, 1);
+    // Главный экран DWIN. Разбор кадра (стейт-машина + очередь) теперь общий
+    // код в Library/dwin.c — здесь только диспетчеризация в нужный канал.
+    // Сама функция перевооружает приём следующего байта в конце.
+    DWIN_Channel_RxCpltFromISR(&dwin_main);
   }
 	if (huart->Instance == USART2)
     {
@@ -928,20 +839,35 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         }
         HAL_UART_Receive_IT(&huart2, &usart2_rx_byte, 1);
     }
-		//Принимаем данные с ETH
-		if (huart->Instance == USART1) {
-        Servo_ProcessRxByte(uart1_rx_byte);
-        // Не вызываем HAL_UART_Receive_IT здесь — это делает Servo_ProcessRxByte
-    }
+	// USART1 (плата-посредник / выносной экран DWIN) — подключается в Шаге 2
+	// (см. dwin2), пока не используется.
 
+}
+/**
+ * @brief  Обработчик ошибок UART (вызывается автоматически из HAL).
+ *         Framing/noise/overrun error — HAL сам останавливает приём при
+ *         таких ошибках, поэтому диспетчер здесь обязателен: без него канал,
+ *         на линии которого случилась ХОТЬ ОДНА наведённая помеха, замолчит
+ *         навсегда (переставший обновляться dwin_main.rx_state).
+ * @param  huart: указатель на структуру UART
+ * @retval None
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART3) {
+    DWIN_Channel_ErrorFromISR(&dwin_main);
+  }
+  // USART1 (dwin_remote) добавится в Шаге 2.
 }
 /**
  * @brief  Запрос текущего часа у дисплея
  * @retval None
  */
 void request_rtc_time(void) {
+  // Команда чтения системного регистра 0x0010 (текущее время RTC экрана) —
+  // это НЕ пользовательский VP, поэтому шлём как "сырой" кадр без трансляции
+  // адреса (DWIN_WriteVariable тут не подходит, см. DWIN_SendRaw).
   uint8_t tx_buffer[7] = {0x5A, 0xA5, 0x04, 0x83, 0x00, 0x10, 0x04};
-  HAL_UART_Transmit(&huart3, tx_buffer, sizeof(tx_buffer), 20);
+  DWIN_SendRaw(&dwin_main, tx_buffer, sizeof(tx_buffer));
 }
 /**
  * @brief  Считывает и возвращает температуру в целых градусах Цельсия (0..60)
@@ -1076,6 +1002,13 @@ void StartGlobalTask(void *argument)
   load_pool_state_from_flash(); // ← загружаем состояние при старте
   // Ждем пока заставка на дисплее прогрузится
   osDelay(2000);
+  // Инициализация DWIN-канала главного экрана: смещение адресов VP = 0,
+  // enabled_flag = NULL (родной экран основного блока отключить нельзя).
+  // ВАЖНО: делать это нужно ДО первого write_variable() ниже — иначе
+  // DWIN_WriteVariable() будет писать в неинициализированный dwin_main.huart.
+  // Сама инициализация уже запускает приём по прерыванию на huart3, поэтому
+  // отдельный HAL_UART_Receive_IT(&huart3, ...) ниже по коду больше не нужен.
+  DWIN_Channel_Init(&dwin_main, &huart3, 0, NULL);
   // Тут проверяем нужно выключать кнопку "Перезагрузить" долив или нет
   if (g_pool_state.filling_error) {
     write_variable(DWIN_ADDR_FILLING_RESET, 0x0000); // Если есть ошибка отображаем кнопку на главном экране
@@ -1102,8 +1035,6 @@ void StartGlobalTask(void *argument)
   osDelay(50);
   write_variable(DWIN_ADDR_SVET, g_pool_state.filling_svet); // Выводим состояние кнопки освещения бассейна
   osDelay(50);
-  HAL_UART_Receive_IT(&huart3, &usart3_rx_byte, 1); // Запускаем прерыние на USART DWIN
-	
   osDelay(100);
   request_rtc_time(); // Запрос данных с rtc
   osDelay(200);
@@ -1120,15 +1051,45 @@ void StartGlobalTask(void *argument)
       request_rtc_time();
       last_rtc_request = osKernelGetTickCount();
     }
-    // === ОБРАБОТКА ВСЕХ НАКОПИВШИХСЯ ПАКЕТОВ DWIN ===
-    while (packet_queue_tail != packet_queue_head) {
-      uart_packet_t pkt = packet_queue[packet_queue_tail];
-      packet_queue_tail = (packet_queue_tail + 1) % PACKET_QUEUE_SIZE;
-      // Парсинг пакета: команда 0x83 (чтение) или 0x82 (запись)
-      if (pkt.length >= 5 && (pkt.data[0] == 0x82 || pkt.data[0] == 0x83)) {
-        uint16_t addr = (pkt.data[1] << 8) | pkt.data[2];
-        uint16_t value = (pkt.data[4] << 8) | pkt.data[5];
-        handle_dwin_command(addr, value);
+    // === ПАССИВНЫЙ КОНТРОЛЬ СВЯЗИ DWIN-КАНАЛОВ ===
+    // Без активных ping-пакетов: если приёмный автомат канала "завис" посреди
+    // кадра дольше таймаута (см. DWIN_RX_STUCK_TIMEOUT_MS в dwin.c) — канал
+    // мягко перезапускается сам. Здесь только регулярный вызов "тика".
+    DWIN_Channel_Poll(&dwin_main, HAL_GetTick());
+    // === ОБРАБОТКА ВСЕХ НАКОПИВШИХСЯ ПАКЕТОВ ГЛАВНОГО ЭКРАНА (USART3) ===
+    {
+      dwin_packet_t pkt;
+      while (DWIN_Channel_PopPacket(&dwin_main, &pkt)) {
+        // --- Ответ на запрос текущего времени (системный регистр 0x0010) ---
+        // Это НЕ пользовательский VP, поэтому смещение канала (addr_offset)
+        // тут не применяется — разбирается как отдельный частный случай ДО
+        // общего разбора VP-команд ниже.
+        // Структура ответа: 83 00 10 04 [8 байт данных]; байт 7 = день недели
+        // (1-7), байт 8 = час (0-23). Пример: 5A A5 0C 83 00 10 04 1A 02 07 06 0F 2E 01 00
+        if (pkt.length >= 12 && pkt.data[0] == 0x83 && pkt.data[1] == 0x00 &&
+            pkt.data[2] == 0x10) {
+          uint8_t day_of_week = pkt.data[7];
+          uint8_t hour = pkt.data[8];
+          if (day_of_week >= 1 && day_of_week <= 7) {
+            current_day_of_week = day_of_week;
+          }
+          if (hour <= 23) {
+            current_hour = hour;
+          }
+          continue; // служебный ответ, а не команда — под общий разбор не подпадает
+        }
+
+        // --- Обычная команда записи/чтения VP (0x82/0x83) ---
+        // Адрес переводится из "проводного" домена канала в родной 0x5000-домен
+        // через DWIN_Channel_ToLocalAddr(). Для USART3 (dwin_main) смещение
+        // равно 0, поэтому число не меняется — но код уже общий для любого
+        // канала (см. аналогичную обработку для dwin_remote в Шаге 2).
+        if (pkt.length >= 5 && (pkt.data[0] == 0x82 || pkt.data[0] == 0x83)) {
+          uint16_t raw_addr = (uint16_t)((pkt.data[1] << 8) | pkt.data[2]);
+          uint16_t value = (uint16_t)((pkt.data[4] << 8) | pkt.data[5]);
+          uint16_t addr = DWIN_Channel_ToLocalAddr(&dwin_main, raw_addr);
+          handle_dwin_command(addr, value);
+        }
       }
     }
 
@@ -1231,8 +1192,10 @@ void StartGlobalTask(void *argument)
 
     // Тут основной цикл выбора режима работы — теперь на согласованном снимке s_*,
     // а не на "живом" g_pool_state без защиты, как было раньше.
-		//ТУТ ПЕРЕМЕННАЯ СЕРВОПРИВОДА 
-    if (!servo_sequence_active) {
+    // Раньше здесь была проверка `if (!servo_sequence_active)`, которая приостанавливала
+    // насосы/нагрев на время цикла обратной промывки сервопривода. Модуль сервопривода
+    // временно удалён (см. dwin2) — условие снято, блок выполняется безусловно.
+    {
       // --- Режим OFF ---
       if (s_mode == POOL_MODE_OFF) {
         pumps_running = 0;
