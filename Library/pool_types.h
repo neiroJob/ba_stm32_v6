@@ -9,8 +9,30 @@ typedef enum {
     POOL_MODE_MANUAL = 6
 } pool_mode_t;
 
+/* === dwin2: версия layout'а pool_state_t для безопасной миграции flash ===
+ * load_pool_state_from_flash() делает СЫРОЙ memcpy этой структуры из
+ * фиксированного адреса flash (POOL_STATE_FLASH_ADDR). При обычной заливке
+ * прошивки через Keil (Download, без полного стирания чипа) эта flash-
+ * страница НЕ стирается — в ней остаются байты, записанные ЕЩЁ СТАРОЙ
+ * версией прошивки. Если структуру расширили (добавили поля в конец, как
+ * main_display_enabled/remote_display_enabled в Шаге 2) — эти новые поля
+ * при memcpy заполнятся не гарантированным нулём/единицей, а произвольным
+ * "мусором" из старой flash-страницы. Ровно это и вызвало баг "оба DWIN-
+ * канала внезапно перестали реагировать после апдейта прошивки" (мусор в
+ * *_display_enabled случайно оказался равен 0 => DWIN_Channel_IsEnabled()
+ * решила, что оба экрана выключены).
+ * Решение: version-барьер. struct_version — ПЕРВОЕ поле структуры.
+ * load_pool_state_from_flash() после memcpy сверяет его с POOL_STATE_VERSION
+ * (константа этой прошивки) — при несовпадении (или после chip erase)
+ * структура принудительно переинициализируется чистыми дефолтами
+ * (init_pool_state()+save), а не доверяет частично valid/частично мусорным
+ * байтам. Правило на будущее: КАЖДЫЙ раз, когда меняется состав/порядок
+ * полей pool_state_t, нужно увеличивать POOL_STATE_VERSION на 1. */
+#define POOL_STATE_VERSION 2
+
 /* === Состояние системы === */
 typedef struct {
+    uint16_t struct_version; // см. POOL_STATE_VERSION выше; ДОЛЖНО быть первым полем
     pool_mode_t mode;
     uint8_t target_temp;
     uint8_t delta_target_temp;
