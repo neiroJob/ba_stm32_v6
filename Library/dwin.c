@@ -16,6 +16,7 @@ void DWIN_Channel_Init(dwin_channel_t *ch, UART_HandleTypeDef *huart,
   ch->enabled_flag = enabled_flag;
   ch->rx_state = DWIN_RX_WAIT_HEADER1;
   ch->last_rx_tick = HAL_GetTick();
+  ch->needs_resync = 1; /* свежий канал — вызывающий код должен один раз послать актуальное состояние целиком */
 
   /* Запускаем приём первого байта. Дальше цепочка сама себя поддерживает:
    * DWIN_Channel_RxCpltFromISR перевооружает приём в конце каждого вызова,
@@ -87,6 +88,11 @@ void DWIN_Channel_RxCpltFromISR(dwin_channel_t *ch) {
 void DWIN_Channel_ErrorFromISR(dwin_channel_t *ch) {
   ch->error_count++;
   ch->last_error_tick = HAL_GetTick();
+  /* usart_error: канал только что сбоил — после восстановления экран может
+   * оказаться с устаревшими данными (пропустил всё, что слалось, пока была
+   * ошибка). needs_resync просит вызывающий код досослать состояние заново
+   * целиком, а не только то, что реально изменится в будущем. */
+  ch->needs_resync = 1;
   /* Недособранный кадр всё равно уже не восстановить — сбрасываем автомат,
    * чтобы следующий валидный заголовок 5A A5 гарантированно подхватился. */
   ch->rx_state = DWIN_RX_WAIT_HEADER1;
@@ -107,6 +113,19 @@ uint8_t DWIN_Channel_PopPacket(dwin_channel_t *ch, dwin_packet_t *out) {
 
 uint16_t DWIN_Channel_ToLocalAddr(const dwin_channel_t *ch, uint16_t raw_addr) {
   return (uint16_t)((int32_t)raw_addr - ch->addr_offset);
+}
+
+uint8_t DWIN_Channel_ConsumeResyncFlag(dwin_channel_t *ch) {
+  /* needs_resync выставляется из ISR (DWIN_Channel_ErrorFromISR) и читается
+   * из задачи — короткая критическая секция на случай, если запись из ISR
+   * попадёт ровно между чтением и сбросом. Секция длится единицы тактов
+   * (чтение байта, сравнение, запись), Poll-ы других каналов и системный
+   * тик от этого не пострадают. */
+  __disable_irq();
+  uint8_t was_set = ch->needs_resync;
+  ch->needs_resync = 0;
+  __enable_irq();
+  return was_set;
 }
 
 void DWIN_WriteVariable(dwin_channel_t *ch, uint16_t local_addr, uint16_t data) {
@@ -133,6 +152,36 @@ void DWIN_SendRaw(dwin_channel_t *ch, const uint8_t *frame, uint16_t len) {
   HAL_UART_Transmit(ch->huart, (uint8_t *)frame, len, 20);
 }
 
+void DWIN_PatchFrameAddress(uint8_t *payload, uint8_t payload_len, int32_t delta) {
+  if (payload_len < 3) {
+    return; /* нет байта CMD + 2 байт адреса VP в этой позиции */
+  }
+  if (payload[0] != DWIN_CMD_WRITE_VP && payload[0] != DWIN_CMD_READ_VP) {
+    return; /* не команда с адресом VP (например, служебный кадр) — не трогаем */
+  }
+  uint16_t addr = (uint16_t)((payload[1] << 8) | payload[2]);
+  addr = (uint16_t)((int32_t)addr + delta);
+  payload[1] = (uint8_t)(addr >> 8);
+  payload[2] = (uint8_t)(addr & 0xFF);
+}
+
+void DWIN_SendRawFrame(dwin_channel_t *ch, const uint8_t *payload, uint8_t payload_len) {
+  if (!DWIN_Channel_IsEnabled(ch)) {
+    return; /* экрана физически нет на этом канале — отправлять некуда */
+  }
+  if (payload_len > DWIN_MAX_PAYLOAD_LEN) {
+    return; /* защита от переполнения — не должно случаться, т.к. payload_len
+             * всегда приходит из DWIN_Channel_PopPacket(), который сам
+             * ограничен тем же DWIN_MAX_PAYLOAD_LEN */
+  }
+  uint8_t tx_buffer[2 + 1 + DWIN_MAX_PAYLOAD_LEN];
+  tx_buffer[0] = DWIN_FRAME_HEADER1;
+  tx_buffer[1] = DWIN_FRAME_HEADER2;
+  tx_buffer[2] = payload_len;
+  memcpy(&tx_buffer[3], payload, payload_len);
+  HAL_UART_Transmit(ch->huart, tx_buffer, (uint16_t)(3 + payload_len), 20);
+}
+
 void DWIN_Channel_Poll(dwin_channel_t *ch, uint32_t now_tick) {
   if (ch->rx_state != DWIN_RX_WAIT_HEADER1) {
     uint32_t idle_ms = now_tick - ch->last_rx_tick; /* корректно и при переполнении HAL_GetTick() */
@@ -143,6 +192,7 @@ void DWIN_Channel_Poll(dwin_channel_t *ch, uint32_t now_tick) {
        * самой периферии USART — см. обсуждение архитектуры канала). */
       ch->rx_state = DWIN_RX_WAIT_HEADER1;
       ch->restart_count++;
+      ch->needs_resync = 1; /* usart_error: как и после ErrorFromISR — досослать состояние заново */
       HAL_UART_Receive_IT(ch->huart, &ch->rx_byte, 1);
     }
   }

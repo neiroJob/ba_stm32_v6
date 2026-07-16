@@ -1160,7 +1160,9 @@ void StartGlobalTask(void *argument)
   request_rtc_time(); // Запрос данных с rtc
   osDelay(200);
   uint32_t last_rtc_request = osKernelGetTickCount();
-	
+  // usart_error: точка отсчёта периодического фолбэк-ресинка экранов (см. ниже в цикле)
+  uint32_t last_full_resync_tick = osKernelGetTickCount();
+
 	HAL_UART_Receive_IT(&huart2, &usart2_rx_buffer[0], 1); // Запускаем приём по USART2 (внешнее управление)
   // Выводим данные долива
   // Выводим данные настройки датчика NTC
@@ -1178,6 +1180,53 @@ void StartGlobalTask(void *argument)
     // мягко перезапускается сам. Здесь только регулярный вызов "тика".
     DWIN_Channel_Poll(&dwin_main, HAL_GetTick());
     DWIN_Channel_Poll(&dwin_remote, HAL_GetTick());
+
+    // === usart_error: РЕСИНК ЭКРАНОВ ПОСЛЕ ВОССТАНОВЛЕНИЯ СВЯЗИ ===
+    // Обычная diff-логика зеркалирования ниже (last_mirrored_*) шлёт на экран
+    // только то, что РЕАЛЬНО изменилось с прошлого раза. Если канал сбоил
+    // (обрыв/помеха на линии, или неисправность где-то внутри платы-
+    // посредника) и восстановился, а пока он был недоступен, сервер или
+    // другой экран поменяли значения — эта diff-логика молчит, потому что с
+    // ЕЁ точки зрения ничего не изменилось (просто некому было это увидеть).
+    // Экран в этом случае так и останется со старыми данными до следующего
+    // ПОДЛИННОГО изменения. Чтобы так не происходило:
+    //  - как только dwin_main или dwin_remote сообщают о восстановлении
+    //    после сбоя (DWIN_Channel_ConsumeResyncFlag — см. dwin.c:
+    //    выставляется в DWIN_Channel_ErrorFromISR и в авто-рестарте внутри
+    //    DWIN_Channel_Poll), сбрасываем last_mirrored_*/last_ico_doliv/
+    //    last_temp в сентинелы — на следующем проходе блок зеркалирования
+    //    ниже отправит вообще ВСЁ состояние заново на оба канала;
+    //  - вдобавок раз в DWIN_FULL_RESYNC_PERIOD_MS (см. pool_types.h) это же
+    //    происходит безусловно — подстраховка от сбоя, который случился не
+    //    на "нашем" канале USART1, а глубже (например, между платой-
+    //    посредником и её локальным дисплеем), и который основной блок со
+    //    своей стороны обнаружить не может в принципе.
+    {
+      uint8_t force_full_resync = 0;
+      if (DWIN_Channel_ConsumeResyncFlag(&dwin_main)) {
+        force_full_resync = 1;
+      }
+      if (DWIN_Channel_ConsumeResyncFlag(&dwin_remote)) {
+        force_full_resync = 1;
+      }
+      if (osKernelGetTickCount() - last_full_resync_tick > DWIN_FULL_RESYNC_PERIOD_MS) {
+        force_full_resync = 1;
+        last_full_resync_tick = osKernelGetTickCount();
+      }
+      if (force_full_resync) {
+        last_mirrored_mode = 0xFFFF;
+        last_mirrored_target_temp = 0xFFFF;
+        last_mirrored_gisterezis = 0xFFFF;
+        last_mirrored_svet = 0xFFFF;
+        last_mirrored_timeout_err = 0xFFFF;
+        last_mirrored_doliv_time = 0xFFFF;
+        last_mirrored_main_display_en = 0xFFFF;
+        last_mirrored_remote_display_en = 0xFFFF;
+        last_ico_doliv = 0xFF;
+        last_temp = 250; // тот же "ещё не выводили" сентинел, что и при объявлении last_temp выше
+      }
+    }
+
     // === ОБРАБОТКА ВСЕХ НАКОПИВШИХСЯ ПАКЕТОВ ГЛАВНОГО ЭКРАНА (USART3) ===
     {
       dwin_packet_t pkt;
