@@ -168,6 +168,16 @@ uint8_t DWIN_Channel_IsEnabled(const dwin_channel_t *ch);
  * чтобы не потерять событие, установленное конкурентно из ISR. */
 uint8_t DWIN_Channel_ConsumeResyncFlag(dwin_channel_t *ch);
 
+/* usart_error: попросить канал ch выставить у себя "нужен полный ресинк" —
+ * ТАК ЖЕ, как это происходит автоматически после ошибки UART
+ * (DWIN_Channel_ErrorFromISR) или "зависшего" кадра (DWIN_Channel_Poll).
+ * Нужна, когда повод для ресинка обнаруживается не на уровне самого UART
+ * (нет ошибки/обрыва как таковых), а на уровне протокола — например, плата-
+ * посредник явно попросила прислать состояние заново служебной VP-командой
+ * после своего старта/переподключения (см. handle_dwin_command() и
+ * DWIN_ADDR_RESYNC_REQUEST в main.c/pool_types.h основного блока). */
+void DWIN_Channel_RequestResync(dwin_channel_t *ch);
+
 /* Преобразовать "сырой" VP-адрес, только что прочитанный из кадра
  * (payload[0..1]), в адрес родного (0x5000) домена: local = raw - addr_offset.
  * Использовать сразу после DWIN_Channel_PopPacket() перед разбором кадра. */

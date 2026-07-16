@@ -740,6 +740,15 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     }
     break;
 
+  case DWIN_ADDR_RESYNC_REQUEST: // служебная команда от платы-посредника после её старта/переподключения
+    // Не пользовательская настройка — не трогаем g_pool_state и НЕ ставим
+    // changed (иначе бы зря дёрнули save_pool_state_to_flash()/isNeedToRefresh
+    // ниже). Просто просим канал выносного экрана переслать всё состояние
+    // заново на следующем проходе цикла — тем же механизмом, что уже
+    // используется после сбоя UART (см. DWIN_Channel_RequestResync()).
+    DWIN_Channel_RequestResync(&dwin_remote);
+    break;
+
   default:
     // Неизвестная команда — игнорируем
     break;

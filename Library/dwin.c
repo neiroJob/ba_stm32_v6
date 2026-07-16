@@ -111,6 +111,10 @@ uint8_t DWIN_Channel_PopPacket(dwin_channel_t *ch, dwin_packet_t *out) {
   return 1;
 }
 
+void DWIN_Channel_RequestResync(dwin_channel_t *ch) {
+  ch->needs_resync = 1;
+}
+
 uint16_t DWIN_Channel_ToLocalAddr(const dwin_channel_t *ch, uint16_t raw_addr) {
   return (uint16_t)((int32_t)raw_addr - ch->addr_offset);
 }
