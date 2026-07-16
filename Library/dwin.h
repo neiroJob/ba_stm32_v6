@@ -117,17 +117,6 @@ typedef struct {
   volatile uint32_t last_error_tick; /* HAL_GetTick() на момент последней ошибки UART */
   volatile uint32_t error_count;     /* счётчик ошибок UART, только для диагностики */
   volatile uint32_t restart_count;   /* сколько раз DWIN_Channel_Poll перезапускал приём, для диагностики */
-
-  /* dwin2/usart_error: "канал только что восстанавливался после сбоя —
-   * нужно полностью досослать актуальное состояние заново". Выставляется
-   * автоматически (DWIN_Channel_Init/ErrorFromISR/Poll — см. их описание
-   * ниже), читается и сбрасывается вызывающим кодом через
-   * DWIN_Channel_ConsumeResyncFlag(). Нужен, потому что обычное "слать
-   * только то, что изменилось" (diff-логика в main.c) не замечает, что
-   * экран мог пропустить обновления, пока канал был "мёртв" — без этого
-   * флага после восстановления связи экран остаётся с устаревшими
-   * значениями до следующего РЕАЛЬНОГО изменения состояния. */
-  volatile uint8_t needs_resync;
 } dwin_channel_t;
 
 /* Инициализация одного канала: обнуляет автомат и очередь, запоминает huart/
@@ -159,15 +148,6 @@ uint8_t DWIN_Channel_PopPacket(dwin_channel_t *ch, dwin_packet_t *out);
 /* 1, если канал сейчас активен (enabled_flag == NULL, либо *enabled_flag != 0). */
 uint8_t DWIN_Channel_IsEnabled(const dwin_channel_t *ch);
 
-/* Прочитать и СБРОСИТЬ флаг "нужен полный ресинк" (см. needs_resync выше).
- * Возвращает 1 ровно один раз после того, как канал восстановился после
- * сбоя (или после инициализации) — вызывающий код должен в ответ на 1
- * заново отправить ВСЕ значения, которые обычно шлются только "по
- * изменению" (diff), а не безусловно каждый цикл. Вызывать из задачи
- * (не из ISR) — внутри выключает прерывания на время чтения+сброса флага,
- * чтобы не потерять событие, установленное конкурентно из ISR. */
-uint8_t DWIN_Channel_ConsumeResyncFlag(dwin_channel_t *ch);
-
 /* Преобразовать "сырой" VP-адрес, только что прочитанный из кадра
  * (payload[0..1]), в адрес родного (0x5000) домена: local = raw - addr_offset.
  * Использовать сразу после DWIN_Channel_PopPacket() перед разбором кадра. */
@@ -188,26 +168,6 @@ void DWIN_WriteVariable(dwin_channel_t *ch, uint16_t local_addr, uint16_t data);
  * по тому же UART, что и VP-команды, но addr_offset к ним неприменим.
  * Как и DWIN_WriteVariable, уважает DWIN_Channel_IsEnabled(). */
 void DWIN_SendRaw(dwin_channel_t *ch, const uint8_t *frame, uint16_t len);
-
-/* === Пересылка пакетов "как есть" (нужна плате-посреднику, usart_error) ===
- * DWIN_WriteVariable() выше рассчитана на устройство, которое ЗНАЕТ, что
- * именно оно пишет (конкретный VP и значение). Плата-посредник же ничего
- * не разбирает по смыслу — она принимает уже готовый payload с ОДНОГО
- * канала (DWIN_Channel_PopPacket), правит в нём 2 байта VP-адреса и
- * пересылает В ДРУГОЙ канал целиком, не трогая остальные байты. */
-
-/* Поправить VP-адрес прямо в уже принятом payload (payload[1..2] — VPH/VPL)
- * на delta (может быть отрицательным). Действует только для команд с
- * адресом (payload[0] == DWIN_CMD_WRITE_VP или DWIN_CMD_READ_VP, len >= 3) —
- * прочие кадры (без адреса VP в этой позиции) не трогает. Вызывать ПЕРЕД
- * DWIN_SendRawFrame(). */
-void DWIN_PatchFrameAddress(uint8_t *payload, uint8_t payload_len, int32_t delta);
-
-/* Собрать полный кадр (5A A5 LEN + payload) из уже готового payload и
- * отправить в канал ch БЕЗ какой-либо трансляции адреса — предполагается,
- * что адрес уже поправлен через DWIN_PatchFrameAddress(), если это было
- * нужно. Как и DWIN_WriteVariable, уважает DWIN_Channel_IsEnabled(). */
-void DWIN_SendRawFrame(dwin_channel_t *ch, const uint8_t *payload, uint8_t payload_len);
 
 /* Периодическое обслуживание канала — вызывать из задачи раз в 100-300 мс
  * для каждого активного канала. Пассивно (без отправки каких-либо ping-
