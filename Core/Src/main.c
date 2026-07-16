@@ -795,21 +795,20 @@ void parse_and_apply_json_command(char* json_str)
     // при отсутствии связи с сервером кнопки на DWIN продолжают работать
     // как обычно.
     uint8_t server_has_fresh_data = 0;
-    char* refresh = strstr(json_str, "\"isNeedToRefresh\":");
+		    char* refresh = strstr(json_str, "\"isNeedToRefresh\":");
     if (refresh) {
         refresh += 18; // Пропускаем "\"isNeedToRefresh\":"
         while (*refresh == ' ' || *refresh == '\t' || *refresh == '\n' || *refresh == '\r') {
             refresh++;
         }
         if (strncmp(refresh, "true", 4) == 0) {
-            server_has_fresh_data = 1;
+					isNeedToRefresh = 0;
+					server_has_fresh_data = 1;
         }
     }
-    if (!server_has_fresh_data) {
-        return; // нечего применять — сервер ещё не сообщил ничего нового
-    }
-
-    // === 1. Парсинг поля "mode" ===
+		//Если у нас топик не изменялся т.е isNeedToRefresh = false
+		if (!isNeedToRefresh && server_has_fresh_data) {
+			// === 1. Парсинг поля "mode" ===
     char* mode_start = strstr(json_str, "\"mode\":\"");
     if (mode_start) {
         mode_start += 8; // Пропускаем "\"mode\":\""
@@ -875,11 +874,7 @@ void parse_and_apply_json_command(char* json_str)
 					}
         }
     }
-		// === 4. Подтверждение получено (мы уже точно знаем server_has_fresh_data==1,
-		// иначе вышли бы из функции раньше) — сбрасываем локальный флаг "жду
-		// синхронизации" с экрана, если он был выставлен handle_dwin_command(). ===
-		isNeedToRefresh = 0;
-
+	}
     // === 5. Сохраняем изменения во флеш НЕМЕДЛЕННО ===
 		//Сохранять нужно только при условии если параметры топиков отличаются т.е. когда топики не равны
 		if (Refrash == 1) {
@@ -1695,7 +1690,7 @@ void StartMqttWrite(void *argument)
         }
         
         // === 5. Ждём 500 мс до следующей отправки ===
-        osDelay(pdMS_TO_TICKS(500));
+        osDelay(pdMS_TO_TICKS(800));
     
   }
   /* USER CODE END StartMqttWrite */

@@ -47,5 +47,5 @@ ba_stm32_v5\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/queue.h
 ba_stm32_v5\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 ba_stm32_v5\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
 ba_stm32_v5\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
-ba_stm32_v5\main.o: ../Library/servo.h
 ba_stm32_v5\main.o: ../Library/pool_types.h
+ba_stm32_v5\main.o: ../Library/dwin.h

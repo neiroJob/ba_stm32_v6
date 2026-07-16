@@ -33,7 +33,7 @@
 "ba_stm32_v5\cmsis_os2.o"
 "ba_stm32_v5\heap_4.o"
 "ba_stm32_v5\port.o"
-"ba_stm32_v5\servo.o"
+"ba_stm32_v5\dwin.o"
 --strict --scatter "BA_STM32_V5\BA_STM32_V5.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers
