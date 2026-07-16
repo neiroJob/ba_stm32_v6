@@ -5,8 +5,11 @@
  * времени — считаем кадр битым/линию оборванной и сбрасываем автомат.
  * Значение с большим запасом относительно скорости 115200 8N1 (кадр из
  * DWIN_MAX_PAYLOAD_LEN=16 байт передаётся физически за доли миллисекунды);
- * 200 мс — это уже явно "тишина", а не пауза между байтами одного кадра. */
-#define DWIN_RX_STUCK_TIMEOUT_MS 200
+ * 200 мс — это уже явно "тишина", а не пауза между байтами одного кадра.
+ * Это ДЕФОЛТ для DWIN_Channel_Init() — подходит для прямого провода к
+ * физическому экрану. Каналы через внешний транспорт (см. stuck_timeout_ms
+ * в dwin.h) переопределяют его через DWIN_Channel_SetStuckTimeout(). */
+#define DWIN_RX_STUCK_TIMEOUT_MS_DEFAULT 200
 
 void DWIN_Channel_Init(dwin_channel_t *ch, UART_HandleTypeDef *huart,
                         int32_t addr_offset, const volatile uint8_t *enabled_flag) {
@@ -17,6 +20,7 @@ void DWIN_Channel_Init(dwin_channel_t *ch, UART_HandleTypeDef *huart,
   ch->rx_state = DWIN_RX_WAIT_HEADER1;
   ch->last_rx_tick = HAL_GetTick();
   ch->needs_resync = 1; /* свежий канал — вызывающий код должен один раз послать актуальное состояние целиком */
+  ch->stuck_timeout_ms = DWIN_RX_STUCK_TIMEOUT_MS_DEFAULT; /* см. DWIN_Channel_SetStuckTimeout() для переопределения */
 
   /* Запускаем приём первого байта. Дальше цепочка сама себя поддерживает:
    * DWIN_Channel_RxCpltFromISR перевооружает приём в конце каждого вызова,
@@ -182,10 +186,14 @@ void DWIN_SendRawFrame(dwin_channel_t *ch, const uint8_t *payload, uint8_t paylo
   HAL_UART_Transmit(ch->huart, tx_buffer, (uint16_t)(3 + payload_len), 20);
 }
 
+void DWIN_Channel_SetStuckTimeout(dwin_channel_t *ch, uint32_t timeout_ms) {
+  ch->stuck_timeout_ms = timeout_ms;
+}
+
 void DWIN_Channel_Poll(dwin_channel_t *ch, uint32_t now_tick) {
   if (ch->rx_state != DWIN_RX_WAIT_HEADER1) {
     uint32_t idle_ms = now_tick - ch->last_rx_tick; /* корректно и при переполнении HAL_GetTick() */
-    if (idle_ms > DWIN_RX_STUCK_TIMEOUT_MS) {
+    if (idle_ms > ch->stuck_timeout_ms) {
       /* Кадр начали собирать, но линия "замолчала" на середине — либо помеха,
        * либо обрыв связи. Сбрасываем автомат и на всякий случай ещё раз
        * вооружаем приём (пассивное восстановление, без переинициализации
