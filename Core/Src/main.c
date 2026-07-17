@@ -103,7 +103,12 @@ const osMutexAttr_t MutexFlash_attributes = {
 volatile uint8_t float_interrupt_flag = 0;
 volatile uint8_t float_new_state = 0;
 //Переменные для MQTT
-volatile uint8_t isNeedToRefresh = 0; 
+volatile uint8_t isNeedToRefresh = 0;
+// Тик HAL_GetTick(), когда isNeedToRefresh был выставлен в 1 — см.
+// ISNEEDTOREFRESH_ACK_TIMEOUT_MS в Library/pool_types.h и его использование
+// в parse_and_apply_json_command(): без этой метки время неизвестно, сколько
+// уже ждём ACK от сервера, и тайм-аут самовосстановления не сработать.
+static uint32_t isNeedToRefresh_set_tick = 0;
 // Адрес эмулированной EEPROM (последняя страница flash: 64 КБ STM32F103C8T6 ->
 // 0x08000000 + 0x10000 = 0x08010000, но безопаснее использовать 0x0800FC00)
 //#define POOL_STATE_FLASH_ADDR ((uint32_t *)0x0800F800)
@@ -758,6 +763,7 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
   if (changed) {
     save_pool_state_to_flash();
 		isNeedToRefresh = 1;
+		isNeedToRefresh_set_tick = HAL_GetTick(); // см. ISNEEDTOREFRESH_ACK_TIMEOUT_MS
   }
 	// === ОСВОБОЖДЕНИЕ МЬЮТЕКСА ===
   osMutexRelease(MutexStateHandle);
@@ -827,7 +833,18 @@ void parse_and_apply_json_command(char* json_str)
         // изменение (ждём ACK, см. п.3 выше) — топик сейчас нельзя считать
         // авторитетным снимком, он может быть устаревшим. Ничего не трогаем,
         // дождёмся ACK на следующих сообщениях.
-        return;
+        //
+        // dwin2: НО если ждём уже дольше ISNEEDTOREFRESH_ACK_TIMEOUT_MS —
+        // ACK, скорее всего, потерян навсегда (обрыв связи, реконнект NT1-M
+        // со сбросом буфера, падение сервера) — см. подробное обоснование у
+        // константы в Library/pool_types.h. Не ждём вечно: сдаёмся, сбрасываем
+        // свой флаг и НЕ выходим — проваливаемся ниже в Механизм 2, чтобы
+        // применить актуальные данные уже из этого сообщения, а не только
+        // начиная со следующего.
+        if ((uint32_t)(HAL_GetTick() - isNeedToRefresh_set_tick) < ISNEEDTOREFRESH_ACK_TIMEOUT_MS) {
+            return;
+        }
+        isNeedToRefresh = 0;
     }
 
     // === Механизм 2: оба isNeedToRefresh false -> "тихо" =================
