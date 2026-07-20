@@ -628,7 +628,16 @@ void save_pool_state_to_flash(void) {
   FLASH_EraseInitTypeDef EraseInitStruct = {0};
   uint32_t PageError = 0;
   EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-  EraseInitStruct.PageAddress = (uint32_t)POOL_STATE_FLASH_ADDR & 0xFFFFF800; // выравнивание, было 0xFFFFFC00
+  // dwin2: 0xFFFFFC00 — выравнивание на границу СТРАНИЦЫ flash (1 КБ у
+  // STM32F103C8, FLASH_PAGE_SIZE=0x400 в stm32f1xx_hal_flash_ex.h). Раньше
+  // тут стояла 0xFFFFF800 (выравнивание на 2 КБ) — для ЭТОГО конкретного
+  // адреса (0x0800F800, он и так кратен 2 КБ) результат совпадал, поэтому
+  // баг был незаметен. Но та же маска, скопированная в
+  // save_pool_schedule_to_flash() для адреса 0x0800FC00 (кратен 1 КБ, но НЕ
+  // 2 КБ), схлопывала вычисленный адрес страницы обратно на 0x0800F800 —
+  // то есть каждое сохранение расписания стирало страницу pool_state_t
+  // вместо своей собственной. См. разбор инцидента в истории коммитов dwin2.
+  EraseInitStruct.PageAddress = (uint32_t)POOL_STATE_FLASH_ADDR & 0xFFFFFC00;
   EraseInitStruct.NbPages = 1;
 
   if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
@@ -713,7 +722,7 @@ void save_pool_schedule_to_flash(void) {
   FLASH_EraseInitTypeDef EraseInitStruct = {0};
   uint32_t PageError = 0;
   EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-  EraseInitStruct.PageAddress = (uint32_t)POOL_SCHEDULE_FLASH_ADDR & 0xFFFFF800;
+  EraseInitStruct.PageAddress = (uint32_t)POOL_SCHEDULE_FLASH_ADDR & 0xFFFFFC00; // выравнивание на 1 КБ, см. пояснение у save_pool_state_to_flash()
   EraseInitStruct.NbPages = 1;
 
   if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
