@@ -109,11 +109,6 @@ volatile uint8_t isNeedToRefresh = 0;
 // в parse_and_apply_json_command(): без этой метки время неизвестно, сколько
 // уже ждём ACK от сервера, и тайм-аут самовосстановления не сработать.
 static uint32_t isNeedToRefresh_set_tick = 0;
-// Адрес эмулированной EEPROM (последняя страница flash: 64 КБ STM32F103C8T6 ->
-// 0x08000000 + 0x10000 = 0x08010000, но безопаснее использовать 0x0800FC00)
-//#define POOL_STATE_FLASH_ADDR ((uint32_t *)0x0800F800)
-// === Расписание фильтрации ===
-//#define POOL_SCHEDULE_FLASH_ADDR ((uint32_t)0x0800F900) // Адрес в флеш-памяти
 // === Текущее время от дисплея ===
 volatile uint8_t current_hour = 0;        // Текущий час (0-23)
 volatile uint8_t current_day_of_week = 1; // День недели (1=Пн, 7=Вс)
