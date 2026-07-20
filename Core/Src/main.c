@@ -582,6 +582,25 @@ void schedule_push_day_to_screen(uint8_t day) {
   write_variable(DWIN_ADDR_SCHEDULE_HOURS_HIGH, g_schedule.days[day].hours_16_23);
 }
 /**
+ * @brief  Проверяет, разрешена ли фильтрация в указанный день недели/час
+ *         по сохранённому расписанию (см. Этап 6, применение в авто-режиме).
+ * @param  day_of_week_1_7: день недели в соглашении RTC-ответа DWIN (1=Пн ... 7=Вс)
+ * @param  hour: час (0-23)
+ * @retval 1, если час разрешён (чекбокс отмечен); 0, если не разрешён ИЛИ
+ *         входные данные некорректны (безопасное поведение по умолчанию —
+ *         считать час запрещённым, а не разрешённым).
+ */
+uint8_t schedule_hour_allowed(uint8_t day_of_week_1_7, uint8_t hour) {
+  if (day_of_week_1_7 < 1 || day_of_week_1_7 > 7 || hour > 23) {
+    return 0;
+  }
+  const day_schedule_t *day = &g_schedule.days[day_of_week_1_7 - 1]; // 1..7 -> 0..6
+  if (hour < 16) {
+    return (uint8_t)((day->hours_0_15 >> hour) & 0x1);
+  }
+  return (uint8_t)((day->hours_16_23 >> (hour - 16)) & 0x1);
+}
+/**
  * @brief  Функция инициализации начальными значениями структуры.
  * @param  argument: Данные
  * @retval None
@@ -807,6 +826,17 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
   case DWIN_ADDR_SVET: // 0x5050 - Нажали вкл\выкл свет в бассейне
     if (g_pool_state.filling_svet != (uint8_t)value) {
       g_pool_state.filling_svet = (uint8_t)value;
+      changed = 1;
+    }
+    break;
+
+  case DWIN_ADDR_HEATING_PRIORITY: // 0x5064 - Чекбокс "Приоритет нагрева"
+    // true (1): в авто-режиме температура может форсировать насосы+нагрев
+    // даже вне расписания (защита воды от переохлаждения важнее графика).
+    // false (0): в авто-режиме нагрев/насосы работают строго по расписанию.
+    // См. применение в блоке выбора режима работы (POOL_MODE_AUTO) ниже.
+    if (g_pool_state.filling_heating_priority != (value != 0)) {
+      g_pool_state.filling_heating_priority = (value != 0) ? 1 : 0;
       changed = 1;
     }
     break;
@@ -1314,7 +1344,6 @@ void StartGlobalTask(void *argument)
   uint8_t s_filling_error = 0;
   uint8_t s_filling_svet = 0;
 
-  uint8_t s_filling_auto_time = 0;
   uint8_t s_filling_heating_priority = 0;
   uint8_t s_filling_heating = 0;
 	pool_mode_t s_mode = POOL_MODE_OFF;
@@ -1552,7 +1581,6 @@ void StartGlobalTask(void *argument)
       s_filling_error            = g_pool_state.filling_error;
       s_filling_svet             = g_pool_state.filling_svet;
       s_mode                     = g_pool_state.mode;
-      s_filling_auto_time        = g_pool_state.filling_auto_time;
       s_filling_heating_priority = g_pool_state.filling_heating_priority;
       s_filling_heating          = g_pool_state.filling_heating;
       // dwin2: снимок полей-"настроек" для живого зеркалирования на оба экрана
@@ -1685,14 +1713,24 @@ void StartGlobalTask(void *argument)
         heating_allowed = s_filling_heating; // Нагрев по температуре
       }
       // --- Автоматический режим ---
+      // dwin2, Этап 6: расписание (g_schedule) заменило старую эвристику
+      // filling_auto_time (то поле никогда фактически не выставлялось в 1
+      // нигде в коде — было заготовкой именно под эту задачу).
       else if (s_mode == POOL_MODE_AUTO) {
-        // Насосы включаются если:
-        // а) Наступило время авто-режима (filling_auto_time = 1), ИЛИ
-        // б) Есть приоритет нагрева И нужен нагрев (filling_heating = 1)
-        pumps_running = s_filling_auto_time ||
-                        (s_filling_heating_priority && s_filling_heating);
+        uint8_t schedule_allows = schedule_hour_allowed(current_day_of_week, current_hour);
+        if (s_filling_heating_priority) {
+          // Приоритет нагрева: температура может форсировать насосы даже
+          // вне расписания — защита воды от переохлаждения важнее графика.
+          pumps_running = schedule_allows || s_filling_heating;
+        } else {
+          // Без приоритета — строго по расписанию, без исключений по температуре.
+          pumps_running = schedule_allows;
+        }
 
-        // Нагрев разрешён если нужен по температуре
+        // Нагрев всегда разрешён только по температуре — а физически
+        // включится только если ещё и pumps_running=1 (см. heating_running
+        // ниже), поэтому и без приоритета нагрев де-факто ограничен
+        // расписанием (насосов нет вне расписания -> нагреву не на чём работать).
         heating_allowed = s_filling_heating;
       }
 
