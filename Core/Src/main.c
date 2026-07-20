@@ -1354,7 +1354,6 @@ void StartGlobalTask(void *argument)
   uint8_t last_temp = 250; // флаг "ещё не выводили" температуру
 
   // Флаги состояний кнопок и иконок на дисплее
-  uint8_t active_button_reset = 0; // Кнопка "Перезагрузить долив"(0 - не ктивна, 1 - активна)
 
   // === Локальный "снимок" разделяемого состояния g_pool_state ===
   // Заполняется одним захватом MutexStateHandle за проход цикла (см. ниже) и
@@ -1367,6 +1366,15 @@ void StartGlobalTask(void *argument)
 	uint8_t last_ico_doliv = 0xFF;
   uint8_t last_ico_filtern = 0xFF;
   uint8_t last_ico_heating = 0xFF;
+  // dwin2: иконка ошибки + кнопка "Перезагрузить долив" (см. ниже в цикле).
+  // Сентинел 0xFF (не 0/1) — как и last_ico_doliv, гарантирует несовпадение
+  // на первом проходе ИЛИ после force_full_resync (сброс ниже), чтобы вновь
+  // подключённый экран (например, включили выносной вместо главного) сразу
+  // получил актуальное состояние, а не ждал следующего реального изменения
+  // filling_error. Раньше был отдельный булевый active_button_reset,
+  // который НЕ участвовал в force_full_resync — баг, найденный на практике:
+  // при переключении на другой экран кнопка не пряталась/не появлялась.
+  uint8_t last_mirrored_filling_error = 0xFF;
 
   // dwin2, живое зеркалирование настроек между экранами: последнее
   // значение каждого поля, которое реально ушло в write_variable(). Пока
@@ -1439,13 +1447,15 @@ void StartGlobalTask(void *argument)
   // Выносной экран / плата-посредник (USART1, смещение адресов VP = +0x1000).
   DWIN_Channel_Init(&dwin_remote, &huart1, DWIN_REMOTE_ADDR_OFFSET,
                      &g_pool_state.remote_display_enabled);
-  // Тут проверяем нужно выключать кнопку "Перезагрузить" долив или нет
+  // Тут проверяем нужно выключать кнопку "Перезагрузить" долив или нет.
+  // Это разовая отправка при старте (для быстрого первого отображения) —
+  // last_mirrored_filling_error ниже её не отслеживает специально: цикл
+  // всё равно пошлёт то же самое ещё раз на первом же проходе (сентинел
+  // 0xFF гарантирует несовпадение), как и для остальных полей-настроек.
   if (g_pool_state.filling_error) {
     write_variable(DWIN_ADDR_FILLING_RESET, 0x0000); // Если есть ошибка отображаем кнопку на главном экране
-    active_button_reset = 1;
   } else {
     write_variable(DWIN_ADDR_FILLING_RESET, 0x0011); // Если нет ошибки выключаем кнопку на главном экране
-    active_button_reset = 0;
   }
   // Выводим все необходимые параметры при старте дисплея
   osDelay(50);
@@ -1541,6 +1551,7 @@ void StartGlobalTask(void *argument)
         last_mirrored_remote_display_en = 0xFFFF;
         last_mirrored_heating_priority = 0xFFFF;
         last_ico_doliv = 0xFF;
+        last_mirrored_filling_error = 0xFF; // см. пояснение у объявления выше
         last_temp = 250; // тот же "ещё не выводили" сентинел, что и при объявлении last_temp выше
       }
     }
@@ -1694,18 +1705,16 @@ void StartGlobalTask(void *argument)
       last_ico_doliv = s_filling_active;
     }
 
-    // Иконка ошибки и кнопка сброса
-    if (s_filling_error && !active_button_reset) {
-      write_variable(DWIN_ADDR_ICO_ERROR, 0x0011); // Иконка ошибки ВКЛ
+    // Иконка ошибки и кнопка сброса — diff-сравнение с сентинелом (см.
+    // last_mirrored_filling_error выше), а не булевый edge-trigger, именно
+    // чтобы участвовать в force_full_resync и корректно досылаться вновь
+    // подключённому/переключённому экрану, а не только при реальном
+    // изменении filling_error.
+    if (s_filling_error != last_mirrored_filling_error) {
+      write_variable(DWIN_ADDR_ICO_ERROR, s_filling_error ? 0x0011 : 0x0000); // Иконка ошибки ВКЛ/ВЫКЛ
       osDelay(pdMS_TO_TICKS(20));
-      write_variable(DWIN_ADDR_FILLING_RESET, 0x0000); // Кнопка сброса ВИДИМА
-      active_button_reset = 1;
-    }
-    if (!s_filling_error && active_button_reset) {
-      write_variable(DWIN_ADDR_ICO_ERROR, 0x0000); // Иконка ошибки ВЫКЛ
-      osDelay(pdMS_TO_TICKS(20));
-      write_variable(DWIN_ADDR_FILLING_RESET, 0x0011); // Кнопка сброса СКРЫТА
-      active_button_reset = 0;
+      write_variable(DWIN_ADDR_FILLING_RESET, s_filling_error ? 0x0000 : 0x0011); // Кнопка сброса ВИДИМА/СКРЫТА
+      last_mirrored_filling_error = s_filling_error;
     }
 
     // === Живое зеркалирование "настроечных" полей на оба экрана ===
