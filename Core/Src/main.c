@@ -864,9 +864,22 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     // вызов нового обработчика вместо старого Servo_RequestBackwash().
     break;
 
-  case DWIN_ADDR_MAIN_DISPLAY_EN: // 0x5900 - Чекбокс "Основной экран подключен"
-    if (g_pool_state.main_display_enabled != (value != 0)) {
-      g_pool_state.main_display_enabled = (value != 0) ? 1 : 0;
+  case DWIN_ADDR_MAIN_DISPLAY_EN: { // 0x5900 - Чекбокс "Основной экран подключен"
+    uint8_t new_main_en = (value != 0) ? 1 : 0;
+    // dwin2: НЕЛЬЗЯ выключать ПОСЛЕДНИЙ активный экран. Если бы оба канала
+    // оказались выключены одновременно — DWIN_Channel_IsEnabled() перестаёт
+    // и писать, и слушать ОБА физических экрана разом, и включить их
+    // обратно с самого экрана стало бы физически невозможно (устройство
+    // "самозапирается" — реальный инцидент, воспроизведённый на практике
+    // из-за ошибки в конфиге Synchrodata Return на экране: Loosen pressing
+    // гасил ту же кнопку, что только что включилась). Поэтому попытку
+    // выключить основной экран, когда выносной и так уже выключен, просто
+    // игнорируем — оставляем основной включённым несмотря на команду.
+    if (new_main_en == 0 && g_pool_state.remote_display_enabled == 0) {
+      break;
+    }
+    if (g_pool_state.main_display_enabled != new_main_en) {
+      g_pool_state.main_display_enabled = new_main_en;
       changed = 1;
       // Оба экрана одновременно работать не должны (взаимоисключение уже
       // настроено на самом экране через Synchrodata Return, но дублируем
@@ -880,18 +893,25 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
       }
     }
     break;
+  }
 
-  case DWIN_ADDR_REMOTE_DISPLAY_EN: // 0x5901 - Чекбокс "Выносной экран подключен"
-    if (g_pool_state.remote_display_enabled != (value != 0)) {
-      g_pool_state.remote_display_enabled = (value != 0) ? 1 : 0;
+  case DWIN_ADDR_REMOTE_DISPLAY_EN: { // 0x5901 - Чекбокс "Выносной экран подключен"
+    uint8_t new_remote_en = (value != 0) ? 1 : 0;
+    // См. пояснение в DWIN_ADDR_MAIN_DISPLAY_EN выше — то же самое, но
+    // в обратную сторону: нельзя выключить выносной, если основной и так
+    // уже выключен.
+    if (new_remote_en == 0 && g_pool_state.main_display_enabled == 0) {
+      break;
+    }
+    if (g_pool_state.remote_display_enabled != new_remote_en) {
+      g_pool_state.remote_display_enabled = new_remote_en;
       changed = 1;
-      // См. пояснение в DWIN_ADDR_MAIN_DISPLAY_EN выше — то же самое, но
-      // в обратную сторону.
       if (g_pool_state.remote_display_enabled && g_pool_state.main_display_enabled) {
         g_pool_state.main_display_enabled = 0;
       }
     }
     break;
+  }
 
   case DWIN_ADDR_RESYNC_REQUEST: // служебная команда от платы-посредника после её старта/переподключения
     // Не пользовательская настройка — не трогаем g_pool_state и НЕ ставим
@@ -1386,6 +1406,17 @@ void StartGlobalTask(void *argument)
 
   // Тут нужно загрузить состояние системы из EEPROM
   load_pool_state_from_flash(); // ← загружаем состояние при старте
+  // dwin2: самовосстановление — если во flash почему-то оказались сохранены
+  // ОБА экрана выключенными (реальный инцидент: баг в конфиге экрана привёл
+  // именно к этому и сохранился на диск ДО того, как появилась защита в
+  // handle_dwin_command выше) — с таким состоянием устройство после
+  // включения не может писать/слушать НИ ОДИН физический экран и
+  // самостоятельно из этого никогда не выйдет. Форсируем основной как
+  // безопасный дефолт и сразу пересохраняем.
+  if (!g_pool_state.main_display_enabled && !g_pool_state.remote_display_enabled) {
+    g_pool_state.main_display_enabled = 1;
+    save_pool_state_to_flash();
+  }
   load_pool_schedule_from_flash(); // ← загружаем расписание автоматического режима
   // Ждем пока заставка на дисплее прогрузится
   osDelay(2000);
