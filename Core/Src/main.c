@@ -1339,6 +1339,7 @@ void StartGlobalTask(void *argument)
   uint16_t last_mirrored_doliv_time = 0xFFFF;
   uint16_t last_mirrored_main_display_en = 0xFFFF;
   uint16_t last_mirrored_remote_display_en = 0xFFFF;
+  uint16_t last_mirrored_heating_priority = 0xFFFF;
 
 	uint8_t s_filling_active = 0;
   uint8_t s_filling_error = 0;
@@ -1408,6 +1409,8 @@ void StartGlobalTask(void *argument)
   osDelay(50);
   write_variable(DWIN_ADDR_REMOTE_DISPLAY_EN, g_pool_state.remote_display_enabled); // Чекбокс "Выносной экран подключен"
   osDelay(50);
+  write_variable(DWIN_ADDR_HEATING_PRIORITY, g_pool_state.filling_heating_priority); // Чекбокс "Приоритет нагрева"
+  osDelay(50);
   schedule_push_day_to_screen(schedule_edit_day); // Расписание: чекбоксы часов дня по умолчанию (Понедельник)
   osDelay(50);
   osDelay(100);
@@ -1423,8 +1426,8 @@ void StartGlobalTask(void *argument)
   /* Infinite loop */
   for (;;) {
     HAL_IWDG_Refresh(&hiwdg);
-    //  Периодический запрос времени раз в 60 секунд
-    if (osKernelGetTickCount() - last_rtc_request > 60000) {
+    //  Периодический запрос времени — см. RTC_REQUEST_PERIOD_MS в pool_types.h
+    if (osKernelGetTickCount() - last_rtc_request > RTC_REQUEST_PERIOD_MS) {
       request_rtc_time();
       last_rtc_request = osKernelGetTickCount();
     }
@@ -1476,6 +1479,7 @@ void StartGlobalTask(void *argument)
         last_mirrored_doliv_time = 0xFFFF;
         last_mirrored_main_display_en = 0xFFFF;
         last_mirrored_remote_display_en = 0xFFFF;
+        last_mirrored_heating_priority = 0xFFFF;
         last_ico_doliv = 0xFF;
         last_temp = 250; // тот же "ещё не выводили" сентинел, что и при объявлении last_temp выше
       }
@@ -1668,6 +1672,10 @@ void StartGlobalTask(void *argument)
     if ((uint16_t)s_remote_display_enabled != last_mirrored_remote_display_en) {
       write_variable(DWIN_ADDR_REMOTE_DISPLAY_EN, s_remote_display_enabled);
       last_mirrored_remote_display_en = (uint16_t)s_remote_display_enabled;
+    }
+    if ((uint16_t)s_filling_heating_priority != last_mirrored_heating_priority) {
+      write_variable(DWIN_ADDR_HEATING_PRIORITY, s_filling_heating_priority);
+      last_mirrored_heating_priority = (uint16_t)s_filling_heating_priority;
     }
 
     // Свет в бассейне вкл\выкл
