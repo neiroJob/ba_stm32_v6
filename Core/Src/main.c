@@ -140,14 +140,6 @@ pool_schedule_t g_schedule; // Расписание автоматическог
 // дня (см. schedule_push_day_to_screen() ниже). По умолчанию Понедельник —
 // экран открывается на нём же.
 static uint8_t schedule_edit_day = 0;
-// Взведён из handle_dwin_command() при нажатии "Сохранить" на экране
-// расписания — просит основной цикл StartGlobalTask опубликовать
-// расписание на сервер ОТДЕЛЬНЫМ сообщением при следующем проходе (см.
-// publish_schedule_json()). Сброс — тоже в основном цикле, не здесь:
-// сама публикация требует блокирующей передачи по UART, а handle_dwin_command
-// уже держит MutexStateHandle — делать это прямо тут нельзя (тот же урок,
-// что и с StartMqttWrite, см. историю коммитов).
-static uint8_t schedule_publish_pending = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -609,36 +601,6 @@ uint8_t schedule_hour_allowed(uint8_t day_of_week_1_7, uint8_t hour) {
   return (uint8_t)((day->hours_16_23 >> (hour - 16)) & 0x1);
 }
 /**
- * @brief  Публикует расписание автоматического режима ОТДЕЛЬНЫМ JSON-
- *         сообщением по USART2 (не в общем статусном JSON из StartMqttWrite
- *         — расписание меняется на порядки реже, раздувать горячий пакет,
- *         отправляемый каждые 800мс, ради него незачем — см. обсуждение
- *         формата и SCHEDULE_HEARTBEAT_PERIOD_MS в Library/pool_types.h).
- *         Массив из 14 чисел: на каждый день недели (0=Пн ... 6=Вс) подряд
- *         hours_0_15, hours_16_23 (см. day_schedule_t в pool_types.h).
- * @param  schedule: снимок расписания. Намеренно принимается копией/
- *         указателем на уже согласованный снимок, а НЕ читает g_schedule
- *         напрямую — вызывающий код должен сам решить вопрос синхронизации
- *         (см. вызовы ниже: снимок делается под MutexStateHandle коротко,
- *         а сама передача — уже вне мьютекса, как и в StartMqttWrite).
- * @retval None
- */
-void publish_schedule_json(const pool_schedule_t *schedule) {
-  char buf[128];
-  int len = snprintf(buf, sizeof(buf),
-      "{\"schedule\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}\r\n",
-      schedule->days[0].hours_0_15, schedule->days[0].hours_16_23,
-      schedule->days[1].hours_0_15, schedule->days[1].hours_16_23,
-      schedule->days[2].hours_0_15, schedule->days[2].hours_16_23,
-      schedule->days[3].hours_0_15, schedule->days[3].hours_16_23,
-      schedule->days[4].hours_0_15, schedule->days[4].hours_16_23,
-      schedule->days[5].hours_0_15, schedule->days[5].hours_16_23,
-      schedule->days[6].hours_0_15, schedule->days[6].hours_16_23);
-  if (len > 0 && len < (int)sizeof(buf)) {
-    HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 50);
-  }
-}
-/**
  * @brief  Функция инициализации начальными значениями структуры.
  * @param  argument: Данные
  * @retval None
@@ -1017,12 +979,9 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     // это тот же порядок захвата мьютексов, что уже используется ниже для
     // save_pool_state_to_flash().
     save_pool_schedule_to_flash();
-    // Просим основной цикл опубликовать расписание на сервер отдельным
-    // сообщением при следующем проходе (см. publish_schedule_json() и
-    // пояснение у schedule_publish_pending выше) — саму публикацию делать
-    // прямо тут нельзя, она включает блокирующую передачу по UART, а мы
-    // сейчас держим MutexStateHandle.
-    schedule_publish_pending = 1;
+    // dwin2: отдельная публикация расписания на сервер больше не нужна —
+    // оно теперь едет постоянно в статусном JSON (StartMqttWrite) каждые
+    // 800мс вместе со всем остальным.
     break;
 
   default:
@@ -1520,8 +1479,6 @@ void StartGlobalTask(void *argument)
   uint32_t last_rtc_request = osKernelGetTickCount();
   // usart_error: точка отсчёта периодического фолбэк-ресинка экранов (см. ниже в цикле)
   uint32_t last_full_resync_tick = osKernelGetTickCount();
-  // dwin2: точка отсчёта heartbeat-публикации расписания (см. SCHEDULE_HEARTBEAT_PERIOD_MS)
-  uint32_t last_schedule_publish_tick = osKernelGetTickCount();
 
 	HAL_UART_Receive_IT(&huart2, &usart2_rx_buffer[0], 1); // Запускаем приём по USART2 (внешнее управление)
   // Выводим данные долива
@@ -1533,21 +1490,6 @@ void StartGlobalTask(void *argument)
     if (osKernelGetTickCount() - last_rtc_request > RTC_REQUEST_PERIOD_MS) {
       request_rtc_time();
       last_rtc_request = osKernelGetTickCount();
-    }
-    // === ПУБЛИКАЦИЯ РАСПИСАНИЯ НА СЕРВЕР (событийно + heartbeat) ===
-    // schedule_publish_pending взводится в handle_dwin_command() при нажатии
-    // "Сохранить"; периодика — фоновая подстраховка на случай потери пакета.
-    // Снимок g_schedule делается коротко под мьютексом, сама (блокирующая)
-    // передача — уже вне его, тот же урок, что и со StartMqttWrite.
-    if (schedule_publish_pending ||
-        (osKernelGetTickCount() - last_schedule_publish_tick > SCHEDULE_HEARTBEAT_PERIOD_MS)) {
-      if (osMutexAcquire(MutexStateHandle, pdMS_TO_TICKS(20)) == osOK) {
-        pool_schedule_t schedule_snapshot = g_schedule;
-        schedule_publish_pending = 0;
-        osMutexRelease(MutexStateHandle);
-        publish_schedule_json(&schedule_snapshot);
-        last_schedule_publish_tick = osKernelGetTickCount();
-      }
     }
     // === ПАССИВНЫЙ КОНТРОЛЬ СВЯЗИ DWIN-КАНАЛОВ ===
     // Без активных ping-пакетов: если приёмный автомат канала "завис" посреди
@@ -2020,7 +1962,11 @@ void StartMqttWrite(void *argument)
 {
   /* USER CODE BEGIN StartMqttWrite */
 	uint8_t temp = 0;  // Текущая температура
-  char json_buffer[256];  // Буфер для формирования JSON
+  // dwin2: буфер увеличен с 256 до 400 — после добавления поля "schedule"
+  // (14 чисел, до 5 знаков каждое в худшем случае) пакет может доходить
+  // почти до 350 байт, со старым буфером в 256 часть сообщения просто не
+  // формировалась бы (см. историю коммитов: недавний баг с обрезанием JSON).
+  char json_buffer[400];  // Буфер для формирования JSON
   int json_len = 0;
 	uint8_t local_isNeedToRefresh;  // Локальная копия флага
 	uint8_t have_json;  // JSON успешно сформирован в этом проходе (мьютекс был захвачен)
@@ -2084,6 +2030,7 @@ void StartMqttWrite(void *argument)
 								"\"dayOfWeek\":%u,"
 								"\"hour\":%u,"
 								"\"activeScreen\":\"%s\","
+								"\"schedule\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
 								"\"isNeedToRefresh\":%s"
                 "}\r\n",
                 temp,
@@ -2099,6 +2046,15 @@ void StartMqttWrite(void *argument)
 								current_day_of_week, // 1=Пн ... 7=Вс (см. current_day_of_week в USER CODE BEGIN PV)
 								current_hour,        // 0-23
 								active_screen_str,   // "main" / "remote" / "none"
+								// Расписание: 14 чисел, на каждый день недели (0=Пн...6=Вс)
+								// подряд hours_0_15, hours_16_23 (см. day_schedule_t в pool_types.h)
+								g_schedule.days[0].hours_0_15, g_schedule.days[0].hours_16_23,
+								g_schedule.days[1].hours_0_15, g_schedule.days[1].hours_16_23,
+								g_schedule.days[2].hours_0_15, g_schedule.days[2].hours_16_23,
+								g_schedule.days[3].hours_0_15, g_schedule.days[3].hours_16_23,
+								g_schedule.days[4].hours_0_15, g_schedule.days[4].hours_16_23,
+								g_schedule.days[5].hours_0_15, g_schedule.days[5].hours_16_23,
+								g_schedule.days[6].hours_0_15, g_schedule.days[6].hours_16_23,
 								local_isNeedToRefresh ? "true" : "false"
             );
             have_json = 1;
@@ -2113,16 +2069,15 @@ void StartMqttWrite(void *argument)
         }
 
         // === 4. Отправляем по USART2 ===
-        // dwin2: таймаут увеличен с 20 до 50 мс. После добавления полей
-        // dayOfWeek/hour/activeScreen пакет вырос примерно с 204 до 252
-        // байт — на 115200 бод (8N1, 10 бит/байт) это ~22 мс на полную
-        // передачу, а прежний таймаут в 20 мс на практике обрывал
-        // передачу на середине буфера: сервер получал обрезанный,
-        // невалидный JSON (найдено на реальном устройстве). Заодно и
-        // передача больше не блокирует MutexStateHandle, который нужен
-        // другим задачам (см. перенос выше).
+        // dwin2: таймаут увеличен с 50 до 80 мс. После добавления поля
+        // "schedule" пакет в худшем случае (все битовые маски максимальны)
+        // доходит почти до 350 байт — на 115200 бод (8N1, 10 бит/байт) это
+        // ~30 мс на полную передачу; 80 мс даёт запас почти в 2.5 раза (тот
+        // же урок про обрезание JSON таймаутом, см. историю коммитов).
+        // Передача не блокирует MutexStateHandle (см. перенос выше), так
+        // что увеличенный таймаут не создаёт лишней конкуренции за мьютекс.
         if (have_json && json_len > 0 && json_len < sizeof(json_buffer)) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 50);
+            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 80);
         }
 
         // === 5. Ждём 500 мс до следующей отправки ===
