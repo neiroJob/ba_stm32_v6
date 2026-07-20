@@ -140,6 +140,14 @@ pool_schedule_t g_schedule; // Расписание автоматическог
 // дня (см. schedule_push_day_to_screen() ниже). По умолчанию Понедельник —
 // экран открывается на нём же.
 static uint8_t schedule_edit_day = 0;
+// Взведён из handle_dwin_command() при нажатии "Сохранить" на экране
+// расписания — просит основной цикл StartGlobalTask опубликовать
+// расписание на сервер ОТДЕЛЬНЫМ сообщением при следующем проходе (см.
+// publish_schedule_json()). Сброс — тоже в основном цикле, не здесь:
+// сама публикация требует блокирующей передачи по UART, а handle_dwin_command
+// уже держит MutexStateHandle — делать это прямо тут нельзя (тот же урок,
+// что и с StartMqttWrite, см. историю коммитов).
+static uint8_t schedule_publish_pending = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -601,6 +609,36 @@ uint8_t schedule_hour_allowed(uint8_t day_of_week_1_7, uint8_t hour) {
   return (uint8_t)((day->hours_16_23 >> (hour - 16)) & 0x1);
 }
 /**
+ * @brief  Публикует расписание автоматического режима ОТДЕЛЬНЫМ JSON-
+ *         сообщением по USART2 (не в общем статусном JSON из StartMqttWrite
+ *         — расписание меняется на порядки реже, раздувать горячий пакет,
+ *         отправляемый каждые 800мс, ради него незачем — см. обсуждение
+ *         формата и SCHEDULE_HEARTBEAT_PERIOD_MS в Library/pool_types.h).
+ *         Массив из 14 чисел: на каждый день недели (0=Пн ... 6=Вс) подряд
+ *         hours_0_15, hours_16_23 (см. day_schedule_t в pool_types.h).
+ * @param  schedule: снимок расписания. Намеренно принимается копией/
+ *         указателем на уже согласованный снимок, а НЕ читает g_schedule
+ *         напрямую — вызывающий код должен сам решить вопрос синхронизации
+ *         (см. вызовы ниже: снимок делается под MutexStateHandle коротко,
+ *         а сама передача — уже вне мьютекса, как и в StartMqttWrite).
+ * @retval None
+ */
+void publish_schedule_json(const pool_schedule_t *schedule) {
+  char buf[128];
+  int len = snprintf(buf, sizeof(buf),
+      "{\"schedule\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}\r\n",
+      schedule->days[0].hours_0_15, schedule->days[0].hours_16_23,
+      schedule->days[1].hours_0_15, schedule->days[1].hours_16_23,
+      schedule->days[2].hours_0_15, schedule->days[2].hours_16_23,
+      schedule->days[3].hours_0_15, schedule->days[3].hours_16_23,
+      schedule->days[4].hours_0_15, schedule->days[4].hours_16_23,
+      schedule->days[5].hours_0_15, schedule->days[5].hours_16_23,
+      schedule->days[6].hours_0_15, schedule->days[6].hours_16_23);
+  if (len > 0 && len < (int)sizeof(buf)) {
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 50);
+  }
+}
+/**
  * @brief  Функция инициализации начальными значениями структуры.
  * @param  argument: Данные
  * @retval None
@@ -979,6 +1017,12 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     // это тот же порядок захвата мьютексов, что уже используется ниже для
     // save_pool_state_to_flash().
     save_pool_schedule_to_flash();
+    // Просим основной цикл опубликовать расписание на сервер отдельным
+    // сообщением при следующем проходе (см. publish_schedule_json() и
+    // пояснение у schedule_publish_pending выше) — саму публикацию делать
+    // прямо тут нельзя, она включает блокирующую передачу по UART, а мы
+    // сейчас держим MutexStateHandle.
+    schedule_publish_pending = 1;
     break;
 
   default:
@@ -1476,6 +1520,8 @@ void StartGlobalTask(void *argument)
   uint32_t last_rtc_request = osKernelGetTickCount();
   // usart_error: точка отсчёта периодического фолбэк-ресинка экранов (см. ниже в цикле)
   uint32_t last_full_resync_tick = osKernelGetTickCount();
+  // dwin2: точка отсчёта heartbeat-публикации расписания (см. SCHEDULE_HEARTBEAT_PERIOD_MS)
+  uint32_t last_schedule_publish_tick = osKernelGetTickCount();
 
 	HAL_UART_Receive_IT(&huart2, &usart2_rx_buffer[0], 1); // Запускаем приём по USART2 (внешнее управление)
   // Выводим данные долива
@@ -1487,6 +1533,21 @@ void StartGlobalTask(void *argument)
     if (osKernelGetTickCount() - last_rtc_request > RTC_REQUEST_PERIOD_MS) {
       request_rtc_time();
       last_rtc_request = osKernelGetTickCount();
+    }
+    // === ПУБЛИКАЦИЯ РАСПИСАНИЯ НА СЕРВЕР (событийно + heartbeat) ===
+    // schedule_publish_pending взводится в handle_dwin_command() при нажатии
+    // "Сохранить"; периодика — фоновая подстраховка на случай потери пакета.
+    // Снимок g_schedule делается коротко под мьютексом, сама (блокирующая)
+    // передача — уже вне его, тот же урок, что и со StartMqttWrite.
+    if (schedule_publish_pending ||
+        (osKernelGetTickCount() - last_schedule_publish_tick > SCHEDULE_HEARTBEAT_PERIOD_MS)) {
+      if (osMutexAcquire(MutexStateHandle, pdMS_TO_TICKS(20)) == osOK) {
+        pool_schedule_t schedule_snapshot = g_schedule;
+        schedule_publish_pending = 0;
+        osMutexRelease(MutexStateHandle);
+        publish_schedule_json(&schedule_snapshot);
+        last_schedule_publish_tick = osKernelGetTickCount();
+      }
     }
     // === ПАССИВНЫЙ КОНТРОЛЬ СВЯЗИ DWIN-КАНАЛОВ ===
     // Без активных ping-пакетов: если приёмный автомат канала "завис" посреди
