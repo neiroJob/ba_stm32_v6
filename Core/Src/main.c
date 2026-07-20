@@ -130,6 +130,7 @@ char usart2_cmd_copy[USART2_RX_BUFFER_SIZE];
 volatile uint16_t usart2_rx_index = 0;
 volatile uint8_t usart2_command_ready = 0;
 pool_state_t g_pool_state;
+pool_schedule_t g_schedule; // Расписание автоматического режима (см. Library/pool_types.h)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -656,6 +657,77 @@ void load_pool_state_from_flash(void) {
   }
 }
 /**
+ * @brief  Функция инициализации расписания автоматического режима значениями
+ *         по умолчанию (ни один час ни в один день изначально не разрешён —
+ *         пользователь настраивает расписание сам на экране "Время фильтрации").
+ * @retval None
+ */
+void init_pool_schedule(void) {
+  memset(&g_schedule, 0, sizeof(g_schedule));
+  g_schedule.struct_version = POOL_SCHEDULE_VERSION;
+}
+/**
+ * @brief  Функция записи расписания автоматического режима в память.
+ *         Пишет в ОТДЕЛЬНУЮ flash-страницу (POOL_SCHEDULE_FLASH_ADDR, см.
+ *         Library/pool_types.h) — та же логика стирания+записи по словам,
+ *         что и save_pool_state_to_flash(), но не трогает страницу pool_state_t.
+ * @retval None
+ */
+void save_pool_schedule_to_flash(void) {
+	// Захватываем тот же мьютекс, что и save_pool_state_to_flash() — операции
+	// с flash в принципе нельзя выполнять параллельно с любой стороны, даже
+	// если страницы разные (HAL_FLASH_Unlock/Lock общие на всю периферию).
+  if (osMutexAcquire(MutexFlashHandle, pdMS_TO_TICKS(150)) != osOK) {
+      return;
+  }
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_PGERR | FLASH_FLAG_WRPERR);
+
+  // Стирание страницы (1 КБ)
+  FLASH_EraseInitTypeDef EraseInitStruct = {0};
+  uint32_t PageError = 0;
+  EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
+  EraseInitStruct.PageAddress = (uint32_t)POOL_SCHEDULE_FLASH_ADDR & 0xFFFFF800;
+  EraseInitStruct.NbPages = 1;
+
+  if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
+    HAL_FLASH_Lock();
+		osMutexRelease(MutexFlashHandle);
+    return; //Ошибка стирания
+  }
+
+  // Запись по словам (4 байта за раз)
+  uint32_t *src = (uint32_t *)&g_schedule;
+  uint32_t *dst = POOL_SCHEDULE_FLASH_ADDR;
+  uint32_t words = (sizeof(pool_schedule_t) + 3) / 4; // округление вверх
+
+  for (uint32_t i = 0; i < words; i++) {
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, (uint32_t)&dst[i], src[i]);
+  }
+
+  HAL_FLASH_Lock();
+	osMutexRelease(MutexFlashHandle);
+}
+/**
+ * @brief  Функция загрузки расписания автоматического режима из памяти.
+ *         Version-барьер — та же защита от "мусора" после неполной
+ *         перезаливки прошивки, что и у load_pool_state_from_flash().
+ * @retval None
+ */
+void load_pool_schedule_from_flash(void) {
+  if (*(uint32_t *)POOL_SCHEDULE_FLASH_ADDR == 0xFFFFFFFF) {
+    // Первая загрузка (страница ещё ни разу не записывалась) — дефолты
+    init_pool_schedule();
+    save_pool_schedule_to_flash();
+  } else {
+    memcpy(&g_schedule, (void *)POOL_SCHEDULE_FLASH_ADDR, sizeof(pool_schedule_t));
+    if (g_schedule.struct_version != POOL_SCHEDULE_VERSION) {
+      init_pool_schedule();
+      save_pool_schedule_to_flash();
+    }
+  }
+}
+/**
  * @brief  Обработчик команд от дисплея DWIN
  * @param  addr: адрес переменной (например, 0x5000)
  * @param  value: значение (16 бит)
@@ -1164,6 +1236,7 @@ void StartGlobalTask(void *argument)
 
   // Тут нужно загрузить состояние системы из EEPROM
   load_pool_state_from_flash(); // ← загружаем состояние при старте
+  load_pool_schedule_from_flash(); // ← загружаем расписание автоматического режима
   // Ждем пока заставка на дисплее прогрузится
   osDelay(2000);
   // Инициализация DWIN-каналов. ВАЖНО: делать это нужно ДО первого
