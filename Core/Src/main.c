@@ -1976,6 +1976,8 @@ void StartMqttWrite(void *argument)
                 "\"toppingUpTime\":%u,"
                 "\"toppingUpFilling\":%u,"
 								"\"countRefrashEeprom\":%u,"
+								"\"dayOfWeek\":%u,"
+								"\"hour\":%u,"
 								"\"isNeedToRefresh\":%s"
                 "}\r\n",
                 temp,
@@ -1988,6 +1990,8 @@ void StartMqttWrite(void *argument)
 								g_pool_state.filling_doliv_time,
 								g_pool_state.filling_timeout_min,
 								g_pool_state.count_refresh_eeprom,
+								current_day_of_week, // 1=Пн ... 7=Вс (см. current_day_of_week в USER CODE BEGIN PV)
+								current_hour,        // 0-23
 								local_isNeedToRefresh ? "true" : "false"
             );
             
