@@ -131,6 +131,15 @@ volatile uint16_t usart2_rx_index = 0;
 volatile uint8_t usart2_command_ready = 0;
 pool_state_t g_pool_state;
 pool_schedule_t g_schedule; // Расписание автоматического режима (см. Library/pool_types.h)
+// Какой день недели сейчас редактируется на экране "Время фильтрации"
+// (0=Пн ... 6=Вс, см. индексацию g_schedule.days[]). Чекбоксы часов
+// (DWIN_ADDR_SCHEDULE_HOURS_LOW/HIGH) на экране ОБЩИЕ для всех дней — сам
+// экран не знает, к какому дню относится присланное значение, поэтому это
+// отслеживает контроллер: вкладка дня переключает эту переменную и просит
+// контроллер прислать обратно на экран сохранённое состояние ИМЕННО этого
+// дня (см. schedule_push_day_to_screen() ниже). По умолчанию Понедельник —
+// экран открывается на нём же.
+static uint8_t schedule_edit_day = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -554,6 +563,23 @@ void write_variable(uint16_t vp_address, uint16_t data) {
   // DWIN_Channel_IsEnabled() в Library/dwin.c.
   DWIN_WriteVariable(&dwin_main, vp_address, data);
   DWIN_WriteVariable(&dwin_remote, vp_address, data);
+}
+/**
+ * @brief  Отправляет на экран сохранённое состояние чекбоксов часов ОДНОГО
+ *         дня расписания (2 слова: DWIN_ADDR_SCHEDULE_HOURS_LOW/HIGH).
+ *         Нужна каждый раз, когда меняется, какой день сейчас показан на
+ *         экране "Время фильтрации" — сам экран не хранит семь наборов
+ *         чекбоксов, у него один общий грид, который надо перерисовать под
+ *         выбранный день (см. schedule_edit_day выше).
+ * @param  day: индекс дня недели (0=Пн ... 6=Вс)
+ * @retval None
+ */
+void schedule_push_day_to_screen(uint8_t day) {
+  if (day >= 7) {
+    return; // защита от мусорного индекса — такого дня не существует
+  }
+  write_variable(DWIN_ADDR_SCHEDULE_HOURS_LOW, g_schedule.days[day].hours_0_15);
+  write_variable(DWIN_ADDR_SCHEDULE_HOURS_HIGH, g_schedule.days[day].hours_16_23);
 }
 /**
  * @brief  Функция инициализации начальными значениями структуры.
@@ -1284,6 +1310,8 @@ void StartGlobalTask(void *argument)
   write_variable(DWIN_ADDR_MAIN_DISPLAY_EN, g_pool_state.main_display_enabled); // Чекбокс "Основной экран подключен"
   osDelay(50);
   write_variable(DWIN_ADDR_REMOTE_DISPLAY_EN, g_pool_state.remote_display_enabled); // Чекбокс "Выносной экран подключен"
+  osDelay(50);
+  schedule_push_day_to_screen(schedule_edit_day); // Расписание: чекбоксы часов дня по умолчанию (Понедельник)
   osDelay(50);
   osDelay(100);
   request_rtc_time(); // Запрос данных с rtc
