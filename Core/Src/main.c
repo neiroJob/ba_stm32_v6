@@ -868,6 +868,16 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     if (g_pool_state.main_display_enabled != (value != 0)) {
       g_pool_state.main_display_enabled = (value != 0) ? 1 : 0;
       changed = 1;
+      // Оба экрана одновременно работать не должны (взаимоисключение уже
+      // настроено на самом экране через Synchrodata Return, но дублируем
+      // здесь на всякий случай — например, если DGUS-конфиг когда-нибудь
+      // поменяют/собьют, или команда придёт из другого источника). Если
+      // основной только что включился, а выносной всё ещё оставался
+      // включён — гасим его. Само изменение попадёт на экран автоматически
+      // через живое зеркалирование ниже в цикле (сравнение с last_mirrored_*).
+      if (g_pool_state.main_display_enabled && g_pool_state.remote_display_enabled) {
+        g_pool_state.remote_display_enabled = 0;
+      }
     }
     break;
 
@@ -875,6 +885,11 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     if (g_pool_state.remote_display_enabled != (value != 0)) {
       g_pool_state.remote_display_enabled = (value != 0) ? 1 : 0;
       changed = 1;
+      // См. пояснение в DWIN_ADDR_MAIN_DISPLAY_EN выше — то же самое, но
+      // в обратную сторону.
+      if (g_pool_state.remote_display_enabled && g_pool_state.main_display_enabled) {
+        g_pool_state.main_display_enabled = 0;
+      }
     }
     break;
 
