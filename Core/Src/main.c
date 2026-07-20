@@ -1960,18 +1960,20 @@ void StartMqttWrite(void *argument)
   /* USER CODE BEGIN StartMqttWrite */
 	uint8_t temp = 0;  // Текущая температура
   char json_buffer[256];  // Буфер для формирования JSON
-  int json_len;
+  int json_len = 0;
 	uint8_t local_isNeedToRefresh;  // Локальная копия флага
+	uint8_t have_json;  // JSON успешно сформирован в этом проходе (мьютекс был захвачен)
   /* Infinite loop */
   for(;;)
   {
+	have_json = 0;
 		// === 1. Получаем текущую температуру из очереди (неблокирующий вызов) ===
         // Используем копию последней известной температуры, если очередь пуста
         if (osMessageQueueGet(TemperatureQueueHandle, &temp, NULL, 0) != osOK) {
             // Если очередь пуста — оставляем предыдущее значение температуры
             // (или можно установить 255 как "ошибка датчика")
         }
-        
+
         // === 2. Защищённое чтение структуры состояния ===
         if (osMutexAcquire(MutexStateHandle, pdMS_TO_TICKS(20)) == osOK) {
 					
@@ -2038,19 +2040,30 @@ void StartMqttWrite(void *argument)
 								active_screen_str,   // "main" / "remote" / "none"
 								local_isNeedToRefresh ? "true" : "false"
             );
-            
-            // === 4. Отправляем по USART2 (неблокирующая передача) ===
-            if (json_len > 0 && json_len < sizeof(json_buffer)) {
-                HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 20);
-            }
+            have_json = 1;
             // Сбрасываем флаг после формирования пакета
 						//if (local_isNeedToRefresh) {
 							//isNeedToRefresh = 0;
 						//}
-            // Освобождаем мьютекс
+            // Освобождаем мьютекс — саму передачу по UART делаем уже ВНЕ
+            // критической секции (json_buffer к этому моменту уже полностью
+            // сформирован, g_pool_state больше не нужен).
             osMutexRelease(MutexStateHandle);
         }
-        
+
+        // === 4. Отправляем по USART2 ===
+        // dwin2: таймаут увеличен с 20 до 50 мс. После добавления полей
+        // dayOfWeek/hour/activeScreen пакет вырос примерно с 204 до 252
+        // байт — на 115200 бод (8N1, 10 бит/байт) это ~22 мс на полную
+        // передачу, а прежний таймаут в 20 мс на практике обрывал
+        // передачу на середине буфера: сервер получал обрезанный,
+        // невалидный JSON (найдено на реальном устройстве). Заодно и
+        // передача больше не блокирует MutexStateHandle, который нужен
+        // другим задачам (см. перенос выше).
+        if (have_json && json_len > 0 && json_len < sizeof(json_buffer)) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 50);
+        }
+
         // === 5. Ждём 500 мс до следующей отправки ===
         osDelay(pdMS_TO_TICKS(800));
     
