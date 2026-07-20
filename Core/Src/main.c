@@ -895,6 +895,17 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     // покажутся при следующем переключении вкладки — они уже в g_schedule.
     break;
 
+  case DWIN_ADDR_SCHEDULE_SAVE: // 0x5062 - "Сохранить" (фиксирует ВСЕ 7 дней разом во flash)
+    // К этому моменту g_schedule уже содержит актуальные данные (чекбоксы
+    // часов шлют 0x5100/0x5101 на контроллер сразу при изменении, см. case
+    // выше) — здесь просто переносим текущее ОЗУ-состояние в постоянную
+    // память. save_pool_schedule_to_flash() сама берёт MutexFlashHandle —
+    // вложенный захват (снаружи уже держим MutexStateHandle) безопасен,
+    // это тот же порядок захвата мьютексов, что уже используется ниже для
+    // save_pool_state_to_flash().
+    save_pool_schedule_to_flash();
+    break;
+
   default:
     // Неизвестная команда — игнорируем
     break;
