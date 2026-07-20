@@ -847,6 +847,54 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     DWIN_Channel_RequestResync(&dwin_remote);
     break;
 
+  // === Расписание автоматического режима (экран "Время фильтрации") ===
+  // Все case ниже НЕ ставят changed — у расписания своя, отдельная от
+  // pool_state_t логика сохранения (пишется в СВОЮ flash-страницу и только
+  // по явному нажатию "Сохранить", см. DWIN_ADDR_SCHEDULE_SAVE ниже, Этап 5).
+
+  case DWIN_ADDR_SCHEDULE_HOURS_LOW: // 0x5100 - часы 00-15 (битовая маска) редактируемого дня
+    g_schedule.days[schedule_edit_day].hours_0_15 = value;
+    break;
+
+  case DWIN_ADDR_SCHEDULE_HOURS_HIGH: // 0x5101 - часы 16-23 (битовая маска) редактируемого дня
+    g_schedule.days[schedule_edit_day].hours_16_23 = value;
+    break;
+
+  case DWIN_ADDR_SCHEDULE_DAY_MON: // 0x5102 - вкладка "Понедельник"
+  case DWIN_ADDR_SCHEDULE_DAY_TUE: // 0x5103 - вкладка "Вторник"
+  case DWIN_ADDR_SCHEDULE_DAY_WED: // 0x5104 - вкладка "Среда"
+  case DWIN_ADDR_SCHEDULE_DAY_THU: // 0x5105 - вкладка "Четверг"
+  case DWIN_ADDR_SCHEDULE_DAY_FRI: // 0x5106 - вкладка "Пятница"
+  case DWIN_ADDR_SCHEDULE_DAY_SAT: // 0x5107 - вкладка "Суббота"
+  case DWIN_ADDR_SCHEDULE_DAY_SUN: // 0x5108 - вкладка "Воскресенье"
+    // value тут — служебная константа экрана (на практике 0x0011), не
+    // полезные данные, см. комментарий у DWIN_ADDR_SCHEDULE_* в
+    // Library/pool_types.h. Индекс дня — по смещению адреса от MON.
+    schedule_edit_day = (uint8_t)(addr - DWIN_ADDR_SCHEDULE_DAY_MON);
+    schedule_push_day_to_screen(schedule_edit_day); // показать сохранённое состояние выбранного дня
+    break;
+
+  case DWIN_ADDR_SCHEDULE_CLEAR_ALL: // 0x5060 - "Очистить всё" (текущий редактируемый день)
+    g_schedule.days[schedule_edit_day].hours_0_15 = 0;
+    g_schedule.days[schedule_edit_day].hours_16_23 = 0;
+    schedule_push_day_to_screen(schedule_edit_day);
+    break;
+
+  case DWIN_ADDR_SCHEDULE_FILL_ALL: // 0x5061 - "Заполнить всё" (текущий редактируемый день)
+    g_schedule.days[schedule_edit_day].hours_0_15 = 0xFFFF;
+    g_schedule.days[schedule_edit_day].hours_16_23 = 0x00FF; // значимы только младшие 8 бит (часы 16-23)
+    schedule_push_day_to_screen(schedule_edit_day);
+    break;
+
+  case DWIN_ADDR_SCHEDULE_COPY_ALL: // 0x5063 - "Копировать на каждый день"
+    for (uint8_t d = 0; d < 7; d++) {
+      g_schedule.days[d] = g_schedule.days[schedule_edit_day];
+    }
+    // Push на экран не нужен: источник копирования — сам текущий показанный
+    // день, визуально ничего не меняется. Остальные 6 дней корректно
+    // покажутся при следующем переключении вкладки — они уже в g_schedule.
+    break;
+
   default:
     // Неизвестная команда — игнорируем
     break;
