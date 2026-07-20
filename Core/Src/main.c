@@ -1963,7 +1963,18 @@ void StartMqttWrite(void *argument)
 				}
 				// Сохраняем локальную копию флага для отправки
 				local_isNeedToRefresh = isNeedToRefresh;
-            
+
+					// Какой экран сейчас активен — одной строкой вместо двух отдельных
+					// булевых полей. main_display_enabled/remote_display_enabled теперь
+					// взаимоисключающие (см. handle_dwin_command), но на случай, если
+					// оба вдруг окажутся выключены — значение "none".
+					const char* active_screen_str = "none";
+					if (g_pool_state.main_display_enabled) {
+						active_screen_str = "main";
+					} else if (g_pool_state.remote_display_enabled) {
+						active_screen_str = "remote";
+					}
+
             // === 3. Формируем JSON-строку ===
             json_len = snprintf(json_buffer, sizeof(json_buffer),
                 "{\"temp\":%d,"
@@ -1978,6 +1989,7 @@ void StartMqttWrite(void *argument)
 								"\"countRefrashEeprom\":%u,"
 								"\"dayOfWeek\":%u,"
 								"\"hour\":%u,"
+								"\"activeScreen\":\"%s\","
 								"\"isNeedToRefresh\":%s"
                 "}\r\n",
                 temp,
@@ -1992,6 +2004,7 @@ void StartMqttWrite(void *argument)
 								g_pool_state.count_refresh_eeprom,
 								current_day_of_week, // 1=Пн ... 7=Вс (см. current_day_of_week в USER CODE BEGIN PV)
 								current_hour,        // 0-23
+								active_screen_str,   // "main" / "remote" / "none"
 								local_isNeedToRefresh ? "true" : "false"
             );
             
