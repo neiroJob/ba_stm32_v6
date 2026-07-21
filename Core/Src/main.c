@@ -825,8 +825,8 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     }
     break;
 
-  case DWIN_ADDR_TIMEOUT_ERR: // 0x5026 - Время наполнения бассейна, поплавок
-    if (value <= 60 && g_pool_state.filling_timeout_min != (uint8_t)value) {
+  case DWIN_ADDR_TIMEOUT_ERR: // 0x5026 - Время наполнения бассейна, поплавок (диапазон 1-99 мин)
+    if (value >= 1 && value <= 99 && g_pool_state.filling_timeout_min != (uint8_t)value) {
       g_pool_state.filling_timeout_min = (uint8_t)value;
       changed = 1;
     }
