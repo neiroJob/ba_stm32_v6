@@ -127,6 +127,22 @@ static volatile uint32_t screen_time_last_tick = 0; // 0 = ни разу не п
 static volatile uint8_t server_hour = 255;
 static volatile uint8_t server_day_of_week = 255;
 static volatile uint32_t server_time_last_tick = 0; // 0 = ни разу не получали
+// === ВРЕМЕННАЯ ОТЛАДКА: "время наполнения" (DWIN_ADDR_TIMEOUT_ERR) самопроизвольно
+// откатывается на выносном экране во время редактирования — причина пока не
+// найдена (гипотеза про коллизию с принудительным ресинком не подтвердилась:
+// ни guard "тихого периода", ни удвоение таймингов эффекта не дали, обе
+// правки откачены). Публикуем в JSON (см. StartMqttWrite) две пары
+// счётчик+тик — "mirror" (когда МЫ САМИ шлём это поле на экран, из diff-блока
+// зеркалирования) и "edit" (когда экран присылает НАМ новое значение,
+// handle_dwin_command case DWIN_ADDR_TIMEOUT_ERR) — чтобы увидеть на живом
+// устройстве, совпадает ли момент отката по времени с mirror-событием (тогда
+// подозрение обоснованно) или нет (тогда причина в чём-то другом, например
+// сам экран шлёт "сырые" промежуточные значения по ходу набора). Убрать
+// после того, как причина найдена и исправлена.
+static volatile uint32_t dbg_timeout_mirror_count = 0;
+static volatile uint32_t dbg_timeout_mirror_tick = 0;
+static volatile uint32_t dbg_timeout_edit_count = 0;
+static volatile uint32_t dbg_timeout_edit_tick = 0;
 // === DWIN: канал главного экрана (USART3, смещение VP-адресов = 0) ===
 // Раньше здесь была россыпь глобальных переменных под ручную стейт-машину
 // разбора кадра (uart_rx_state, packet_buffer, packet_index, packet_queue...).
@@ -829,6 +845,9 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     if (value <= 60 && g_pool_state.filling_timeout_min != (uint8_t)value) {
       g_pool_state.filling_timeout_min = (uint8_t)value;
       changed = 1;
+      // ВРЕМЕННАЯ ОТЛАДКА — см. пояснение у dbg_timeout_edit_count в USER CODE BEGIN PV
+      dbg_timeout_edit_count++;
+      dbg_timeout_edit_tick = HAL_GetTick();
     }
     break;
 		
@@ -1818,6 +1837,9 @@ void StartGlobalTask(void *argument)
     if ((uint16_t)s_filling_timeout_min != last_mirrored_timeout_err) {
       write_variable(DWIN_ADDR_TIMEOUT_ERR, s_filling_timeout_min);
       last_mirrored_timeout_err = (uint16_t)s_filling_timeout_min;
+      // ВРЕМЕННАЯ ОТЛАДКА — см. пояснение у dbg_timeout_mirror_count в USER CODE BEGIN PV
+      dbg_timeout_mirror_count++;
+      dbg_timeout_mirror_tick = HAL_GetTick();
     }
     if ((uint16_t)s_filling_doliv_time != last_mirrored_doliv_time) {
       write_variable(DWIN_ADDR_DOLIV_TIME, s_filling_doliv_time);
@@ -2043,7 +2065,10 @@ void StartMqttWrite(void *argument)
   // (14 чисел, до 5 знаков каждое в худшем случае) пакет может доходить
   // почти до 350 байт, со старым буфером в 256 часть сообщения просто не
   // формировалась бы (см. историю коммитов: недавний баг с обрезанием JSON).
-  char json_buffer[400];  // Буфер для формирования JSON
+  // Было 400 — хватало впритык (~349 байт худший случай) до добавления
+  // отладочных полей dbgTo*. 4 новых поля добавляют до ~106 байт в худшем
+  // случае (uint32 tick/счётчик, до 10 цифр каждый) — увеличено с запасом.
+  char json_buffer[550];  // Буфер для формирования JSON
   int json_len = 0;
 	uint8_t local_isNeedToRefresh;  // Локальная копия флага
 	uint8_t have_json;  // JSON успешно сформирован в этом проходе (мьютекс был захвачен)
@@ -2108,6 +2133,12 @@ void StartMqttWrite(void *argument)
 								"\"hour\":%u,"
 								"\"activeScreen\":\"%s\","
 								"\"schedule\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+								// ВРЕМЕННАЯ ОТЛАДКА бага "время наполнения откатывается на выносном
+								// экране" — см. dbg_timeout_* в USER CODE BEGIN PV. Убрать вместе с ними.
+								"\"dbgToMirrorCnt\":%lu,"
+								"\"dbgToMirrorMs\":%lu,"
+								"\"dbgToEditCnt\":%lu,"
+								"\"dbgToEditMs\":%lu,"
 								"\"isNeedToRefresh\":%s"
                 "}\r\n",
                 temp,
@@ -2132,6 +2163,10 @@ void StartMqttWrite(void *argument)
 								g_schedule.days[4].hours_0_15, g_schedule.days[4].hours_16_23,
 								g_schedule.days[5].hours_0_15, g_schedule.days[5].hours_16_23,
 								g_schedule.days[6].hours_0_15, g_schedule.days[6].hours_16_23,
+								(unsigned long)dbg_timeout_mirror_count,
+								(unsigned long)dbg_timeout_mirror_tick,
+								(unsigned long)dbg_timeout_edit_count,
+								(unsigned long)dbg_timeout_edit_tick,
 								local_isNeedToRefresh ? "true" : "false"
             );
             have_json = 1;
@@ -2154,7 +2189,10 @@ void StartMqttWrite(void *argument)
         // Передача не блокирует MutexStateHandle (см. перенос выше), так
         // что увеличенный таймаут не создаёт лишней конкуренции за мьютекс.
         if (have_json && json_len > 0 && json_len < sizeof(json_buffer)) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 80);
+            // Таймаут поднят вместе с буфером (80->100 мс) — см. пояснение у
+            // json_buffer выше. ~550 байт при 115200 8N1 ~ 47.7 мс передачи,
+            // 100 мс оставляет тот же запас, что был у прежних значений.
+            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 100);
         }
 
         // === 5. Ждём 500 мс до следующей отправки ===
