@@ -109,6 +109,12 @@ volatile uint8_t isNeedToRefresh = 0;
 // в parse_and_apply_json_command(): без этой метки время неизвестно, сколько
 // уже ждём ACK от сервера, и тайм-аут самовосстановления не сработать.
 static uint32_t isNeedToRefresh_set_tick = 0;
+// Тик HAL_GetTick(), когда пользователь последний раз реально поменял
+// какое-то поле с экрана (handle_dwin_command, changed=1) — см.
+// EDIT_QUIET_PERIOD_MS в Library/pool_types.h и его использование в
+// StartGlobalTask(): защищает свежую правку от немедленной перезаписи
+// принудительным полным ресинком. 0 = правок ещё не было.
+static uint32_t last_local_edit_tick = 0;
 // === Текущее время: ИТОГОВОЕ (эффективное) значение ===
 // Пересчитывается каждый проход основного цикла (см. StartGlobalTask) из
 // двух источников ниже, экран приоритетнее сервера — см. пояснение у
@@ -1009,6 +1015,7 @@ void handle_dwin_command(uint16_t addr, uint16_t value) {
     save_pool_state_to_flash();
 		isNeedToRefresh = 1;
 		isNeedToRefresh_set_tick = HAL_GetTick(); // см. ISNEEDTOREFRESH_ACK_TIMEOUT_MS
+		last_local_edit_tick = HAL_GetTick(); // см. EDIT_QUIET_PERIOD_MS
   }
 	// === ОСВОБОЖДЕНИЕ МЬЮТЕКСА ===
   osMutexRelease(MutexStateHandle);
@@ -1576,7 +1583,16 @@ void StartGlobalTask(void *argument)
         force_full_resync = 1;
         last_full_resync_tick = osKernelGetTickCount();
       }
-      if (force_full_resync) {
+      // usart_error: если пользователь только что (< EDIT_QUIET_PERIOD_MS назад)
+      // реально поменял поле с экрана — пропускаем принудительный полный
+      // ресинк в ЭТОМ проходе, чтобы не переслать экрану устаревший снимок,
+      // пока свежая правка ещё может быть "в пути" (см. EDIT_QUIET_PERIOD_MS
+      // в pool_types.h). Ничего не теряем: обычная diff-логика зеркалирования
+      // ниже как обычно немедленно отправит РЕАЛЬНОЕ изменение, а полный
+      // ресинк просто сработает на следующем подходящем случае.
+      uint8_t in_edit_quiet_period = (last_local_edit_tick != 0) &&
+                                      ((uint32_t)(HAL_GetTick() - last_local_edit_tick) < EDIT_QUIET_PERIOD_MS);
+      if (force_full_resync && !in_edit_quiet_period) {
         last_mirrored_mode = 0xFFFF;
         last_mirrored_target_temp = 0xFFFF;
         last_mirrored_gisterezis = 0xFFFF;
