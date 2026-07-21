@@ -2066,9 +2066,10 @@ void StartMqttWrite(void *argument)
   // почти до 350 байт, со старым буфером в 256 часть сообщения просто не
   // формировалась бы (см. историю коммитов: недавний баг с обрезанием JSON).
   // Было 400 — хватало впритык (~349 байт худший случай) до добавления
-  // отладочных полей dbgTo*. 4 новых поля добавляют до ~106 байт в худшем
-  // случае (uint32 tick/счётчик, до 10 цифр каждый) — увеличено с запасом.
-  char json_buffer[550];  // Буфер для формирования JSON
+  // отладочных полей dbgTo*/dbgErr*. Каждая группа добавляет до ~106-122
+  // байт в худшем случае (uint32 счётчики, до 10 цифр каждый) — увеличено
+  // с запасом на обе сразу.
+  char json_buffer[700];  // Буфер для формирования JSON
   int json_len = 0;
 	uint8_t local_isNeedToRefresh;  // Локальная копия флага
 	uint8_t have_json;  // JSON успешно сформирован в этом проходе (мьютекс был захвачен)
@@ -2139,6 +2140,16 @@ void StartMqttWrite(void *argument)
 								"\"dbgToMirrorMs\":%lu,"
 								"\"dbgToEditCnt\":%lu,"
 								"\"dbgToEditMs\":%lu,"
+								// ВРЕМЕННАЯ ОТЛАДКА: реальная частота ошибок/автовосстановлений на
+								// физических DWIN-каналах (dwin_channel_t.error_count/restart_count,
+								// см. Library/dwin.h — "только для диагностики"). Проверяем гипотезу,
+								// что причина отката "времени наполнения" — не совпадение с таймерами
+								// ресинка, а сама частота сбоев линии основная плата<->мост (dwin_remote),
+								// на порядок выше, чем у главного экрана (dwin_main).
+								"\"dbgMainErrCnt\":%lu,"
+								"\"dbgMainRestartCnt\":%lu,"
+								"\"dbgRemoteErrCnt\":%lu,"
+								"\"dbgRemoteRestartCnt\":%lu,"
 								"\"isNeedToRefresh\":%s"
                 "}\r\n",
                 temp,
@@ -2167,6 +2178,10 @@ void StartMqttWrite(void *argument)
 								(unsigned long)dbg_timeout_mirror_tick,
 								(unsigned long)dbg_timeout_edit_count,
 								(unsigned long)dbg_timeout_edit_tick,
+								(unsigned long)dwin_main.error_count,
+								(unsigned long)dwin_main.restart_count,
+								(unsigned long)dwin_remote.error_count,
+								(unsigned long)dwin_remote.restart_count,
 								local_isNeedToRefresh ? "true" : "false"
             );
             have_json = 1;
@@ -2189,10 +2204,10 @@ void StartMqttWrite(void *argument)
         // Передача не блокирует MutexStateHandle (см. перенос выше), так
         // что увеличенный таймаут не создаёт лишней конкуренции за мьютекс.
         if (have_json && json_len > 0 && json_len < sizeof(json_buffer)) {
-            // Таймаут поднят вместе с буфером (80->100 мс) — см. пояснение у
-            // json_buffer выше. ~550 байт при 115200 8N1 ~ 47.7 мс передачи,
-            // 100 мс оставляет тот же запас, что был у прежних значений.
-            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 100);
+            // Таймаут поднят вместе с буфером (100->130 мс) — см. пояснение у
+            // json_buffer выше. ~700 байт при 115200 8N1 ~ 60.8 мс передачи,
+            // 130 мс оставляет тот же запас, что был у прежних значений.
+            HAL_UART_Transmit(&huart2, (uint8_t*)json_buffer, (uint16_t)json_len, 130);
         }
 
         // === 5. Ждём 500 мс до следующей отправки ===
