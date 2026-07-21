@@ -109,9 +109,24 @@ volatile uint8_t isNeedToRefresh = 0;
 // в parse_and_apply_json_command(): без этой метки время неизвестно, сколько
 // уже ждём ACK от сервера, и тайм-аут самовосстановления не сработать.
 static uint32_t isNeedToRefresh_set_tick = 0;
-// === Текущее время от дисплея ===
-volatile uint8_t current_hour = 0;        // Текущий час (0-23)
-volatile uint8_t current_day_of_week = 1; // День недели (1=Пн, 7=Вс)
+// === Текущее время: ИТОГОВОЕ (эффективное) значение ===
+// Пересчитывается каждый проход основного цикла (см. StartGlobalTask) из
+// двух источников ниже, экран приоритетнее сервера — см. пояснение у
+// SCREEN_TIME_STALE_MS/SERVER_TIME_STALE_MS в Library/pool_types.h. Именно
+// эти две переменные читают schedule_hour_allowed() и исходящий JSON
+// (StartMqttWrite) — обеих источников касаться не должны, только этой пары.
+// 255 = "время неизвестно ни от одного источника" (по аналогии с temp=255
+// у датчика NTC — безопасное значение по умолчанию, а не "полночь понедельника").
+volatile uint8_t current_hour = 255;
+volatile uint8_t current_day_of_week = 255;
+// === Текущее время: источник "экран" (RTC-регистр 0x0010, см. request_rtc_time) ===
+static volatile uint8_t screen_hour = 255;
+static volatile uint8_t screen_day_of_week = 255;
+static volatile uint32_t screen_time_last_tick = 0; // 0 = ни разу не получали
+// === Текущее время: источник "сервер" (поля dayOfWeek/hour во входящем JSON) ===
+static volatile uint8_t server_hour = 255;
+static volatile uint8_t server_day_of_week = 255;
+static volatile uint32_t server_time_last_tick = 0; // 0 = ни разу не получали
 // === DWIN: канал главного экрана (USART3, смещение VP-адресов = 0) ===
 // Раньше здесь была россыпь глобальных переменных под ручную стейт-машину
 // разбора кадра (uart_rx_state, packet_buffer, packet_index, packet_queue...).
@@ -1150,7 +1165,28 @@ void parse_and_apply_json_command(char* json_str)
 					}
         }
     }
-    // === 4. Сохраняем изменения во флеш НЕМЕДЛЕННО ===
+
+    // === 4. Резервный источник времени — dayOfWeek/hour с сервера ===
+    // Не влияет на Refrash/flash — это отдельный, независимый от pool_state
+    // источник (см. SCREEN_TIME_STALE_MS/SERVER_TIME_STALE_MS в pool_types.h).
+    // Оба поля разбираем и принимаем ТОЛЬКО парой — если пришла только
+    // валидная часть (например, день битый, а час нет), не обновляем ничего,
+    // чтобы не оставить current_day_of_week/current_hour рассинхронизированными
+    // между собой. 255 от сервера (он тоже не знает время) намеренно не
+    // проходит проверку диапазона ниже и не считается свежим значением.
+    char* dow_start = strstr(json_str, "\"dayOfWeek\":");
+    char* hour_start = strstr(json_str, "\"hour\":");
+    if (dow_start && hour_start) {
+        uint8_t dow_value = (uint8_t)atoi(dow_start + 12); // Пропускаем "\"dayOfWeek\":"
+        uint8_t hour_value = (uint8_t)atoi(hour_start + 7); // Пропускаем "\"hour\":"
+        if (dow_value >= 1 && dow_value <= 7 && hour_value <= 23) {
+            server_day_of_week = dow_value;
+            server_hour = hour_value;
+            server_time_last_tick = HAL_GetTick();
+        }
+    }
+
+    // === 5. Сохраняем изменения во флеш НЕМЕДЛЕННО ===
 		//Сохранять нужно только при условии если параметры топиков отличаются т.е. когда топики не равны
 		if (Refrash == 1) {
 			save_pool_state_to_flash();
@@ -1573,13 +1609,17 @@ void StartGlobalTask(void *argument)
         // (1-7), байт 8 = час (0-23). Пример: 5A A5 0C 83 00 10 04 1A 02 07 06 0F 2E 01 00
         if (pkt.length >= 12 && pkt.data[0] == 0x83 && pkt.data[1] == 0x00 &&
             pkt.data[2] == 0x10) {
+          // dwin2: пишем в screen_*, а не напрямую в current_* — итоговое
+          // значение теперь считается раз за проход цикла с учётом резервного
+          // источника (сервер) и "протухания", см. блок пересчёта ниже и
+          // SCREEN_TIME_STALE_MS в pool_types.h. Принимаем только парой, как
+          // и на сервере — не оставляем день/час рассинхронизированными.
           uint8_t day_of_week = pkt.data[7];
           uint8_t hour = pkt.data[8];
-          if (day_of_week >= 1 && day_of_week <= 7) {
-            current_day_of_week = day_of_week;
-          }
-          if (hour <= 23) {
-            current_hour = hour;
+          if (day_of_week >= 1 && day_of_week <= 7 && hour <= 23) {
+            screen_day_of_week = day_of_week;
+            screen_hour = hour;
+            screen_time_last_tick = HAL_GetTick();
           }
           continue; // служебный ответ, а не команда — под общий разбор не подпадает
         }
@@ -1623,13 +1663,14 @@ void StartGlobalTask(void *argument)
         // в Library/dwin.c — правка на обеих платах, main и посредник).
         if (pkt.length >= 12 && pkt.data[0] == 0x83 && pkt.data[1] == 0x00 &&
             pkt.data[2] == 0x10) {
+          // dwin2: см. пояснение у аналогичного блока главного экрана выше —
+          // тот же переход на screen_*/пересчёт эффективного значения раз в проход.
           uint8_t day_of_week = pkt.data[7];
           uint8_t hour = pkt.data[8];
-          if (day_of_week >= 1 && day_of_week <= 7) {
-            current_day_of_week = day_of_week;
-          }
-          if (hour <= 23) {
-            current_hour = hour;
+          if (day_of_week >= 1 && day_of_week <= 7 && hour <= 23) {
+            screen_day_of_week = day_of_week;
+            screen_hour = hour;
+            screen_time_last_tick = HAL_GetTick();
           }
           continue; // служебный ответ, а не команда — под общий разбор не подпадает
         }
@@ -1639,6 +1680,33 @@ void StartGlobalTask(void *argument)
           uint16_t addr = DWIN_Channel_ToLocalAddr(&dwin_remote, raw_addr);
           handle_dwin_command(addr, value);
         }
+      }
+    }
+
+    // === ПЕРЕСЧЁТ ЭФФЕКТИВНОГО ТЕКУЩЕГО ВРЕМЕНИ (экран -> сервер -> 255) ===
+    // current_day_of_week/current_hour — единственное, что читают
+    // schedule_hour_allowed() (ниже) и исходящий JSON (StartMqttWrite).
+    // Экран приоритетнее, пока его данные свежие (пришли не раньше
+    // SCREEN_TIME_STALE_MS назад) — иначе, если сервер успел прислать своё
+    // значение не позже SERVER_TIME_STALE_MS назад, берём его. Если оба
+    // источника протухли (или их не было ни разу — тик всё ещё 0) — честно
+    // публикуем "не знаем" (255), а не устаревшее/угаданное значение. См.
+    // подробное обоснование констант в Library/pool_types.h.
+    {
+      uint32_t now = HAL_GetTick();
+      uint8_t screen_fresh = (screen_time_last_tick != 0) &&
+                              ((uint32_t)(now - screen_time_last_tick) < SCREEN_TIME_STALE_MS);
+      uint8_t server_fresh = (server_time_last_tick != 0) &&
+                              ((uint32_t)(now - server_time_last_tick) < SERVER_TIME_STALE_MS);
+      if (screen_fresh) {
+        current_day_of_week = screen_day_of_week;
+        current_hour = screen_hour;
+      } else if (server_fresh) {
+        current_day_of_week = server_day_of_week;
+        current_hour = server_hour;
+      } else {
+        current_day_of_week = 255;
+        current_hour = 255;
       }
     }
 
@@ -2052,8 +2120,8 @@ void StartMqttWrite(void *argument)
 								g_pool_state.filling_doliv_time,
 								g_pool_state.filling_timeout_min,
 								g_pool_state.count_refresh_eeprom,
-								current_day_of_week, // 1=Пн ... 7=Вс (см. current_day_of_week в USER CODE BEGIN PV)
-								current_hour,        // 0-23
+								current_day_of_week, // 1=Пн...7=Вс, 255="не знаем" (экран и сервер молчат/протухли)
+								current_hour,        // 0-23, 255="не знаем" — см. пересчёт в StartGlobalTask
 								active_screen_str,   // "main" / "remote" / "none"
 								// Расписание: 14 чисел, на каждый день недели (0=Пн...6=Вс)
 								// подряд hours_0_15, hours_16_23 (см. day_schedule_t в pool_types.h)
